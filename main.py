@@ -31,13 +31,13 @@ def main():
     parser.add_argument('--model', default='meta-llama/Llama-2-7b-hf', type=str, help='LLaMA model')
     parser.add_argument('--seed', type=int, default=0, help='Seed for sampling the calibration data.')
     parser.add_argument('--nsamples', type=int, default=128, help='Number of calibration samples.')
-    parser.add_argument('--sparsity_ratio', type=float, default=0, help='Sparsity level')
+    parser.add_argument('--sparsity_ratio', type=float, default=0.5, help='Sparsity level')
     parser.add_argument("--sparsity_type", type=str, default='unstructured', choices=["unstructured", "4:8", "2:4"])
     parser.add_argument("--prune_method", default='wanda', type=str, choices=["magnitude", "wanda", "sparsegpt", 
                         "ablate_mag_seq", "ablate_wanda_seq", "ablate_mag_iter", "ablate_wanda_iter", "search"])
     parser.add_argument("--cache_dir", default="llm_weights", type=str )
     parser.add_argument('--use_variant', action="store_true", help="whether to use the wanda variant described in the appendix")
-    parser.add_argument('--save', type=str, default=None, help='Path to save results.')
+    parser.add_argument('--save', type=str, default='output', help='Path to save results.')
     parser.add_argument('--save_model', type=str, default=None, help='Path to save the pruned model.')
 
     parser.add_argument("--eval_zero_shot", action="store_true")
@@ -76,13 +76,13 @@ def main():
             prune_ablate(args, model, tokenizer, device, prune_n=prune_n, prune_m=prune_m)
 
     # ################################################################
-    # print("*"*30)
-    # sparsity_ratio = check_sparsity(model)
-    # print(f"sparsity sanity check {sparsity_ratio:.4f}")
-    # print("*"*30)
+    print("*"*30)
+    sparsity_ratio = check_sparsity(model)
+    print(f"sparsity sanity check {sparsity_ratio:.4f}")
+    print("*"*30)
     # ################################################################
-    # ppl_test = eval_ppl(args, model, tokenizer, device)
-    # print(f"wikitext perplexity {ppl_test}")
+    ppl_test = eval_ppl(args, model, tokenizer, device)
+    print(f"wikitext perplexity {ppl_test}")
 
     # if not os.path.exists(args.save):
     #     os.makedirs(args.save)
