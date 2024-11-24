@@ -140,28 +140,34 @@ def eval_zero_shot(model_name, model, tokenizer, task_list=["boolq","rte","hella
             for matching in fnmatch.filter(source_list, pattern):
                 task_names.add(matching)
         return list(task_names)
-    task_names = pattern_match(task_list, tasks.ALL_TASKS)
-    model_args = f"pretrained={model_name},cache_dir=./llm_weights"
+    task_manager = tasks.TaskManager()
+    task_names = pattern_match(task_list, task_manager.all_tasks)
+    print(task_names)
+    
     limit = None 
     if "70b" in model_name or "65b" in model_name:
         limit = 2000
-    if use_accelerate:
-        model_args = f"pretrained={model_name},cache_dir=./llm_weights,use_accelerate=True"
+    # model_args = f"pretrained={model_name},cache_dir=./llm_weights"
+    # if use_accelerate:
+        # model_args = f"pretrained={model_name},cache_dir=./llm_weights,use_accelerate=True"
+    model_args={"pretrained":model, "cache_dir":"./llm_weights", "use_accelerate":use_accelerate, 
+                "add_special_tokens":add_special_tokens, "tokenizer":tokenizer}
+        
     results = evaluator.simple_evaluate(
-        model="hf-causal-experimental",
+        # model="hf-causal-experimental",
+        model='hf-auto',
         model_args=model_args,
         tasks=task_names,
         num_fewshot=num_fewshot,
         batch_size=None,
         device=None,
-        no_cache=True,
+        # no_cache=True,
         limit=limit,
-        description_dict={},
-        decontamination_ngrams_path=None,
+        # description_dict={},
+        # decontamination_ngrams_path=None,
         check_integrity=False,
-        pretrained_model=model,
-        tokenizer=tokenizer, 
-        add_special_tokens=add_special_tokens
+        # pretrained_model=model,
+        # add_special_tokens=add_special_tokens
     )
 
     return results 
