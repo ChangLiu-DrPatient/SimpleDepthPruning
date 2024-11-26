@@ -1,2 +1,5 @@
 llm_weights/
 logs/
+outdir/
+scripts.txt
+play.ipynb

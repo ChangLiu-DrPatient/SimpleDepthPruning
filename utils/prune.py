@@ -7,7 +7,7 @@ import torch.nn as nn
 from .sparsegpt import SparseGPT 
 from .layerwrapper import WrappedGPT
 from .data import get_loaders 
-
+from .bonsai_utils import *
 from .ablate import AblateGPT 
 
 def find_layers(module, layers=[nn.Linear], name=''):
@@ -130,8 +130,8 @@ def prune_wanda(args, model, tokenizer, device=torch.device("cuda:0"), prune_n=0
     use_cache = model.config.use_cache 
     model.config.use_cache = False 
 
-    print("loading calibdation data")
-    dataloader, _ = get_loaders("c4",nsamples=args.nsamples,seed=args.seed,seqlen=model.seqlen,tokenizer=tokenizer)
+    print("loading calibration data")
+    dataloader, _ = get_loaders(args.calib_dataset,nsamples=args.nsamples,seed=args.seed,seqlen=model.seqlen,tokenizer=tokenizer)
     print("dataset loading complete")
     with torch.no_grad():
         inps, outs, attention_mask, position_ids = prepare_calibration_input(model, dataloader, device)
@@ -211,8 +211,63 @@ def prune_wanda(args, model, tokenizer, device=torch.device("cuda:0"), prune_n=0
     model.config.use_cache = use_cache 
     torch.cuda.empty_cache()
 
-def prun_bonsai(args, model, tokenizer, device=torch.device("cuda:0"), prune_n=0, prune_m=0):
-    pass# TODO
+def prune_bonsai(args, model, tokenizer, device=torch.device("cuda:0")):
+    # TODO
+    # migrating main() in the Bonsai code.
+
+    str_of_args = args_to_str(args)
+    args.save = os.path.join(args.save, str_of_args)
+    os.makedirs(args.save, exist_ok=True)
+    # wandb_run = wandb.init(
+	# 	project=args.wandb_project_name,
+	# 	name=str_of_args,
+	# 	config=args_to_dict(args),
+	# )
+
+    # orig_train_ppl, orig_test_ppl = eval_ppl(model, tokenizer, model.device, dataset=args.calib_dataset)
+    # print(f"original train ppl {orig_train_ppl}; original test ppl {orig_test_ppl}")
+    
+    original_param_count = get_param_count(model)
+    model.original_param_count = original_param_count
+    cur_sparsity = 1.0 - (get_param_count(model) / original_param_count)
+    epoch_ = 1
+
+    while args.sparsity_ratio - cur_sparsity >= args.tol:
+       
+       # Need to check if we have to clip the sparsity ratio (if the current ratio causes us to overshoot)
+        if (cur_sparsity + args.prune_frac) > args.sparsity_ratio:
+            # We would overshoot in this case which is not idea.
+            old_prune_frac = args.prune_frac
+            args.prune_frac = abs(args.sparsity_ratio - cur_sparsity)
+            print('We have updated the prune fraction {:.3f} -> {:.3f} to avoid overshooting'.format(old_prune_frac, args.prune_frac))
+        
+        print('Gathering statistics for pruning')
+        save_loc = os.path.join(args.save, 'mask_info_{}.pkl'.format(epoch_))
+        if os.path.exists(save_loc):
+            print('Successfully loaded past pruning info')
+            with open(save_loc, 'rb') as handle:
+                mask_info = pkl.load(handle)
+        else:
+            mask_info = investigate_score_based_mask(args, model, wandb_run=None, epoch_=epoch_)
+            with open(save_loc, 'wb') as handle:
+                pkl.dump(mask_info, handle)
+        
+        print('Prune model')
+        prune_model(args, model, mask_info, tokenizer) # Do some stuffs here :)
+        cur_sparsity = 1.0 - (get_param_count(model) / original_param_count)
+		# print(model)
+
+		# Evaluate the performance of the pruned model
+        ppl_train, ppl_test = eval_ppl(model, tokenizer, model.device, dataset=args.calib_dataset)
+
+        # wandb_run.log({'Sparsity': cur_sparsity, 'TrainPPL': ppl_train, 'TestPPL': ppl_test})
+        print('Sparsity = {:.3f}| Train PPL = {:.3f} | Test PPL = {:.3f}'.format(cur_sparsity, ppl_train, ppl_test))
+
+        epoch_ += 1
+
+    # wandb_run.log({'sparsity': cur_sparsity})
+    print(f'sparsity = {cur_sparsity:.4f}')
+
 
 @torch.no_grad()
 def prune_sparsegpt(args, model, tokenizer, dev, prune_n=0, prune_m=0):
