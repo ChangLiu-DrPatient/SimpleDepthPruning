@@ -9,6 +9,7 @@ from .layerwrapper import WrappedGPT
 from .data import get_loaders 
 from .bonsai_utils import *
 from .ablate import AblateGPT 
+from .layer_merging import *
 
 def find_layers(module, layers=[nn.Linear], name=''):
     """
@@ -268,6 +269,22 @@ def prune_bonsai(args, model, tokenizer, device=torch.device("cuda:0")):
     # wandb_run.log({'sparsity': cur_sparsity})
     print(f'sparsity = {cur_sparsity:.4f}')
 
+#! our method
+def merge_layers(args, model, tokenizer, device=torch.device("cuda:0")):
+    original_size = get_model_size(model)
+    print(f"Original model size: {original_size:.2f} MB")
+
+    merge_ranges = [tuple(map(int, r.split('-'))) for r in args.merge_ranges]
+    print(f"Merging layer ranges: {merge_ranges}")
+    model = merge_multiple_ranges(model, merge_ranges, args.model_type, args.num_components)
+
+    print("Updating model configuration after merging...")
+    model = update_model_after_merge(model, args.model_type, merge_ranges, args.num_components)
+
+    merged_size = get_model_size(model)
+    print(f"Merged model size: {merged_size:.2f} MB")
+    print(f"Size reduction: {(original_size - merged_size) / original_size * 100:.2f}%")
+    return model
 
 @torch.no_grad()
 def prune_sparsegpt(args, model, tokenizer, dev, prune_n=0, prune_m=0):

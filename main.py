@@ -1,12 +1,10 @@
 
-import argparse
-import os 
+import argparse, os, torch, json
 import numpy as np
-import torch
-from transformers import AutoTokenizer, AutoModelForCausalLM
+from transformers import AutoTokenizer, AutoModelForCausalLM, AutoConfig
 from importlib.metadata import version
 
-from utils.prune import prune_wanda, prune_magnitude, prune_sparsegpt, prune_bonsai, prune_ablate, check_sparsity, find_layers
+from utils.prune import prune_wanda, prune_magnitude, prune_sparsegpt, prune_bonsai, prune_ablate, check_sparsity, merge_layers
 from utils.eval import eval_ppl, eval_zero_shot
 # bonsai
 from utils.lib.modelling_llama_mod import LlamaForCausalLM
@@ -15,6 +13,109 @@ print('torch', version('torch'))
 print('transformers', version('transformers'))
 print('accelerate', version('accelerate'))
 print('# of gpus: ', torch.cuda.device_count())
+
+
+def load_model_with_rope_scaling_adjustment(model_name, cache_dir='llm_weights', use_auth_token=True, use_bfloat16=False):
+    # local_path = get_local_model_path(model_path)
+    
+    # Create base directory if it doesn't exist
+    # os.makedirs(local_path, exist_ok=True)
+    
+    # Check if model already exists locally
+    # if not check_model_exists(local_path):
+    #     print(f"Model not found in {local_path}. Downloading...")
+    #     try:
+    #         # Download model files to local path
+    #         config = AutoConfig.from_pretrained(model_path, use_auth_token=use_auth_token)
+    #         model = AutoModelForCausalLM.from_pretrained(
+    #             model_path,
+    #             use_auth_token=use_auth_token,
+    #             torch_dtype=torch.bfloat16 if use_bfloat16 else None
+    #         )
+    #         tokenizer = AutoTokenizer.from_pretrained(model_path, use_auth_token=use_auth_token)
+            
+    #         # Save files locally
+    #         config.save_pretrained(local_path)
+    #         model.save_pretrained(local_path)
+    #         tokenizer.save_pretrained(local_path)
+    #         print(f"Model downloaded and saved to {local_path}")
+    #     except Exception as e:
+    #         print(f"Error downloading model: {e}")
+    #         raise
+    # else:
+    #     print(f"Loading model from local cache: {local_path}")
+
+    
+    # try:
+    #     with open(os.path.join(local_path, 'config.json'), 'r') as f:
+    #         config_dict = json.load(f)
+        
+    #     if 'rope_scaling' in config_dict:
+    #         original_rope_scaling = config_dict['rope_scaling'].copy()
+    #         print(f"Original rope_scaling: {original_rope_scaling}")
+            
+    #         config_dict['rope_scaling'] = {
+    #             'type': original_rope_scaling.get('rope_type', 'linear'),
+    #             'factor': original_rope_scaling.get('factor', 1.0)
+    #         }
+    #         print(f"Adjusted rope_scaling: {config_dict['rope_scaling']}")
+        
+    #     config = AutoConfig.from_pretrained(None, **config_dict)
+        
+    #     if use_bfloat16:
+    #         model = AutoModelForCausalLM.from_pretrained(
+    #             local_path,
+    #             config=config,
+    #             torch_dtype=torch.bfloat16
+    #         )
+    #     else:
+    #         model = AutoModelForCausalLM.from_pretrained(
+    #             local_path,
+    #             config=config
+    #         )
+    # except Exception as e:
+    #     print(f"Error loading model with config adjustment: {e}")
+    #     print("Attempting to load model without config adjustment...")
+    #     if use_bfloat16:
+    #         model = AutoModelForCausalLM.from_pretrained(
+    #             local_path,
+    #             torch_dtype=torch.bfloat16
+    #         )
+    #     else:
+    #         model = AutoModelForCausalLM.from_pretrained(local_path)
+    config = AutoConfig.from_pretrained(model_name)
+    if hasattr(config, 'rope_scaling'):
+        original_rope_scaling = config.rope_scaling
+        if original_rope_scaling is not None:
+            print(f"Original rope_scaling: {original_rope_scaling}")
+            
+            config.rope_scaling = {
+                'type': original_rope_scaling.get('rope_type', 'linear'),
+                'factor': original_rope_scaling.get('factor', 1.0)
+            }
+        print(f"Adjusted rope_scaling: {config.rope_scaling}")
+    # # print(config_dict)
+    # if 'rope_scaling' in config_dict and config_dict['rope_scaling'] is not None:
+    #     original_rope_scaling = config_dict['rope_scaling'].copy()
+    #     print(f"Original rope_scaling: {original_rope_scaling}")
+        
+    #     config_dict['rope_scaling'] = {
+    #         'type': original_rope_scaling.get('rope_type', 'linear'),
+    #         'factor': original_rope_scaling.get('factor', 1.0)
+    #     }
+    #     print(f"Adjusted rope_scaling: {config_dict['rope_scaling']}")
+    
+    # config = AutoConfig.from_pretrained(model_name, **config_dict)
+    # turn config_dict back to config
+    # config = Config.from_dict(config_dict)
+    model = AutoModelForCausalLM.from_pretrained(model_name, 
+                                                cache_dir=cache_dir,
+                                                config=config,
+                                                torch_dtype=torch.bfloat16 if use_bfloat16 else torch.float16,
+                                                low_cpu_mem_usage=True, 
+                                                device_map="auto")
+    model.seqlen = model.config.max_position_embeddings 
+    return model
 
 def get_llm(model_name, cache_dir="llm_weights"):
     model = AutoModelForCausalLM.from_pretrained(
@@ -57,7 +158,7 @@ def main():
     parser.add_argument('--sparsity_ratio', type=float, default=0.5, help='Sparsity level')
     parser.add_argument("--sparsity_type", type=str, default='unstructured', choices=["unstructured", "4:8", "2:4"])  # not for bonsai
     parser.add_argument('--calib_dataset', type=str, default="c4", choices=["wikitext2", "c4"])
-    parser.add_argument("--prune_method", default='wanda', type=str, choices=["magnitude", "wanda", "sparsegpt", "bonsai",
+    parser.add_argument("--prune_method", default='merge', type=str, choices=["merge", "magnitude", "wanda", "sparsegpt", "bonsai",
                         "ablate_mag_seq", "ablate_wanda_seq", "ablate_mag_iter", "ablate_wanda_iter", "search"])
     #! --- for Bonsai starts
     parser.add_argument('--bonsai_prune_method', type=str, default="wanda", choices=["magnitude", "wanda", "random"])
@@ -75,6 +176,14 @@ def main():
     parser.add_argument('--sm_bsz', type=str, default='[32, 64, 128]', help='batch size for fitting linear model')
     parser.add_argument('--sm_nepochs', type=int, default=50, help='number of epochs to use to fit the linear model')
     #! --- for Bonsai ends
+
+    #! --- for merging starts
+    parser.add_argument("--model_type", choices=["opt", "llama", "gemma"], default="llama", help="Type of model to use")
+    parser.add_argument("--merge_ranges", nargs="+", default=['14-19'], help="Ranges of layers to merge, e.g., '2-12 14-17 18-19'")
+    parser.add_argument("--use_bfloat16", action="store_true", help="Use bfloat16 precision")
+    parser.add_argument("--num_components", type=int, default=1, help="Number of principal components to use for merging")
+    #! --- for merging ends
+    
     parser.add_argument("--cache_dir", default="llm_weights", type=str )
     parser.add_argument('--use_variant', action="store_true", help="whether to use the wanda variant described in the appendix")
     parser.add_argument('--save', type=str, default='output', help='Path to save results.')
@@ -95,10 +204,19 @@ def main():
 
     model_name = args.model.split("/")[-1]
     print(f"loading llm model {args.model}")
-    if not args.prune_method == 'bonsai':
-        model = get_llm(args.model, args.cache_dir)
-    else:
+
+    if args.prune_method == 'merge':
+        model = load_model_with_rope_scaling_adjustment(args.model, args.cache_dir, use_bfloat16=args.use_bfloat16)
+        # model = get_llm(args.model, args.cache_dir)
+        # assert 1==0
+    elif args.prune_method == 'bonsai':
         model = get_llm_bonsai(args.model, args.cache_dir)
+    else:
+        model = get_llm(args.model, args.cache_dir)
+        
+
+    
+
     model.eval()
     original_nozero_param_count = get_nonzero_param_count(model)
     tokenizer = AutoTokenizer.from_pretrained(args.model, use_fast=False)
@@ -110,7 +228,9 @@ def main():
 
     if args.sparsity_ratio != 0:
         print("pruning starts")
-        if args.prune_method == "wanda":
+        if args.prune_method == "merge":
+            model = merge_layers(args, model, tokenizer, device)
+        elif args.prune_method == "wanda":
             prune_wanda(args, model, tokenizer, device, prune_n=prune_n, prune_m=prune_m)
         elif args.prune_method == "magnitude":
             prune_magnitude(args, model, tokenizer, device, prune_n=prune_n, prune_m=prune_m)
@@ -120,7 +240,7 @@ def main():
             prune_bonsai(args, model, tokenizer, device)
         elif "ablate" in args.prune_method:
             prune_ablate(args, model, tokenizer, device, prune_n=prune_n, prune_m=prune_m)
-
+    
     # ################################################################
     print("*"*30)
     sparsity_ratio = check_sparsity(model)
@@ -129,6 +249,7 @@ def main():
     sparsity_ratio_unified = 1 - cur_nozero_param_count / original_nozero_param_count
     print(f"sparsity unified {sparsity_ratio_unified:.4f}")
     print("*"*30)
+    # assert 1==0
     # ################################################################
     ppl_test = eval_ppl(args, model, tokenizer, device)
     print(f"wikitext perplexity {ppl_test}")
