@@ -15,3 +15,7 @@ integrated Bonsai as a baseline. The "--dataset" flag in the Bonsai repo is modi
 ```
 CUDA_VISIBLE_DEVICES=1 python main.py --model meta-llama/Llama-2-7b-hf --calib_dataset wikitext2 --sparsity_ratio 0.5 --masks_per_iter 6 --nsamples 1 --save outdir --prune_frac 0.1 --bsz 1 --prune_method bonsai --eval_zero_shot
 ```
+
+12/5/2024：
+
+integrated the layer merging method, parallel to other pruning methods.
