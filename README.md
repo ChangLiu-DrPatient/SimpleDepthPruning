@@ -19,3 +19,7 @@ CUDA_VISIBLE_DEVICES=1 python main.py --model meta-llama/Llama-2-7b-hf --calib_d
 12/5/2024：
 
 integrated the layer merging method, parallel to other pruning methods.
+
+12/15/2024:
+
+added automatic layer selection heuristic and model size/memory helper function.

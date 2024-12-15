@@ -10,6 +10,9 @@ from .data import get_loaders
 from .bonsai_utils import *
 from .ablate import AblateGPT 
 from .layer_merging import *
+from .eval import get_layer_output_similarity
+from scipy.sparse.csgraph import connected_components
+from scipy.sparse import csr_matrix
 
 def find_layers(module, layers=[nn.Linear], name=''):
     """
@@ -270,12 +273,46 @@ def prune_bonsai(args, model, tokenizer, device=torch.device("cuda:0")):
     print(f'sparsity = {cur_sparsity:.4f}')
 
 #! our method
+def find_blocks_indices(matrix):
+    n = matrix.shape[0]
+    blocks = []
+    start = 0
+    
+    while start < n:
+        if matrix[start, start] == 1:
+            # Find how far the block extends
+            end = start + 1
+            while end < n:
+                # Check if the submatrix is all ones
+                if not np.all(matrix[start:end+1, start:end+1] == 1):
+                    break
+                end += 1
+            blocks.append((start, end-1))
+            start = end
+        else:
+            start += 1
+            
+    return blocks
+
 def merge_layers(args, model, tokenizer, device=torch.device("cuda:0")):
     original_size = get_model_size(model)
     print(f"Original model size: {original_size:.2f} MB")
-
-    merge_ranges = [tuple(map(int, r.split('-'))) for r in args.merge_ranges]
+    if args.merge_ranges == 'auto':
+        #TODO determine the merge ranges automatically
+        layer_similarity = get_layer_output_similarity(model, tokenizer, device)
+        binarized_similarity = (layer_similarity > args.merge_thresh).astype(float)
+        # print(layer_similarity[:5, :5])
+        # binarized_similarity_csr = csr_matrix(binarized_similarity)
+        # _, connected_layers = connected_components(csgraph=binarized_similarity_csr, directed=False, return_labels=True)
+        connected_layers = find_blocks_indices(binarized_similarity)
+        print(connected_layers)
+        merge_ranges = [x for x in connected_layers if x[1] - x[0] > 0]
+        # eval_ppl(args, model, tokenizer, device)
+        # assert 1==0
+    else:
+        merge_ranges = [tuple(map(int, r.split('-'))) for r in args.merge_ranges]
     print(f"Merging layer ranges: {merge_ranges}")
+    # assert 1==0
     model = merge_multiple_ranges(model, merge_ranges, args.model_type, args.num_components)
 
     print("Updating model configuration after merging...")
@@ -284,6 +321,7 @@ def merge_layers(args, model, tokenizer, device=torch.device("cuda:0")):
     merged_size = get_model_size(model)
     print(f"Merged model size: {merged_size:.2f} MB")
     print(f"Size reduction: {(original_size - merged_size) / original_size * 100:.2f}%")
+    
     return model
 
 @torch.no_grad()

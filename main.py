@@ -150,6 +150,19 @@ def get_nonzero_param_count(model, exclude=['embed', 'head']):
         if not any(x in n for x in exclude)
     ])
 
+def get_model_size_and_memory(model):
+    # output model size and memory usage (in MB)
+    model_size = sum(p.numel() for p in model.parameters())
+    
+    param_size = 0
+    for param in model.parameters():
+        param_size += param.nelement() * param.element_size()
+    buffer_size = 0
+    for buffer in model.buffers():
+        buffer_size += buffer.nelement() * buffer.element_size()
+    model_memory = (param_size + buffer_size) / 1024**2
+    return model_size, model_memory
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--model', default='meta-llama/Llama-2-7b-hf', type=str, help='LLaMA model')
@@ -179,7 +192,8 @@ def main():
 
     #! --- for merging starts
     parser.add_argument("--model_type", choices=["opt", "llama", "gemma"], default="llama", help="Type of model to use")
-    parser.add_argument("--merge_ranges", nargs="+", default=['14-19'], help="Ranges of layers to merge, e.g., '2-12 14-17 18-19'")
+    parser.add_argument("--merge_ranges", nargs="+", default='auto', help="Ranges of layers to merge, e.g., '2-12 14-17 18-19', or 'auto'")
+    parser.add_argument("--merge_thresh", type=float, default='0.8', help="Threshold for merging the layers")
     parser.add_argument("--use_bfloat16", action="store_true", help="Use bfloat16 precision")
     parser.add_argument("--num_components", type=int, default=1, help="Number of principal components to use for merging")
     #! --- for merging ends
@@ -219,6 +233,7 @@ def main():
 
     model.eval()
     original_nozero_param_count = get_nonzero_param_count(model)
+    orig_size, orig_memory = get_model_size_and_memory(model)
     tokenizer = AutoTokenizer.from_pretrained(args.model, use_fast=False)
 
     device = torch.device("cuda:0")
@@ -241,6 +256,14 @@ def main():
         elif "ablate" in args.prune_method:
             prune_ablate(args, model, tokenizer, device, prune_n=prune_n, prune_m=prune_m)
     
+
+    compressed_size, compressed_memory = get_model_size_and_memory(model)
+    print("*"*30)
+    print(f"original model size: {orig_size / 1e9:.2f} B, compressed model size: {compressed_size / 1e9:.2f} B")
+    print(f"original model memory: {orig_memory / 1024:.2f} GB, compressed model memory: {compressed_memory / 1024:.2f} GB")
+    print(f"compression ratio: {compressed_size / orig_size:.2%}")
+    print('model compressed \n')
+    # assert 1==0
     # ################################################################
     print("*"*30)
     sparsity_ratio = check_sparsity(model)
@@ -251,8 +274,8 @@ def main():
     print("*"*30)
     # assert 1==0
     # ################################################################
-    ppl_test = eval_ppl(args, model, tokenizer, device)
-    print(f"wikitext perplexity {ppl_test}")
+    # ppl_test = eval_ppl(args, model, tokenizer, device)
+    # print(f"wikitext perplexity {ppl_test}")
 
     # if not os.path.exists(args.save):
     #     os.makedirs(args.save)
