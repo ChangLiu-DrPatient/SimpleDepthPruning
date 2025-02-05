@@ -1,5 +1,8 @@
 llm_weights/
 logs/
 outdir/
-scripts.txt
-play.ipynb
+output/
+*.txt
+*.pkl
+*.ipynb
+*.npy

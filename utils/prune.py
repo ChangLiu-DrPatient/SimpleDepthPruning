@@ -1,8 +1,6 @@
 # Code from https://github.com/locuslab/wanda/blob/main/lib/prune.py
 
-import time 
-import heapq 
-import torch 
+import time, pickle, heapq, copy, torch
 import torch.nn as nn 
 from .sparsegpt import SparseGPT 
 from .layerwrapper import WrappedGPT
@@ -273,7 +271,48 @@ def prune_bonsai(args, model, tokenizer, device=torch.device("cuda:0")):
     print(f'sparsity = {cur_sparsity:.4f}')
 
 #! our method
-def find_blocks_indices(matrix):
+def find_blocks_indices(sim, matrix):
+    n = matrix.shape[0]
+    blocks = []
+    start = 0
+
+    if n == 1:
+        return [(0, 0)]
+    while start < n:
+        if matrix[start, start] == 1:
+            # Find how far the block extends
+            end = start + 1
+            while end < n:
+                # Check if the submatrix is all ones
+                if not np.all(matrix[start:end+1, start:end+1] == 1):
+                    break
+                end += 1
+
+            min_sim = np.min(sim[start:end+1, start:end+1])
+            blocks.append(((start, end-1), min_sim))
+            start += 1
+        else:
+            start += 1
+    largest_block = sorted(blocks, key=lambda x: (x[0][1]-x[0][0], x[1]), reverse=True)[0][0]
+
+    matrix_before = matrix[:largest_block[0], :largest_block[0]]
+    matrix_after = matrix[largest_block[1]+1:, largest_block[1]+1:]
+
+    if matrix_before.shape[0] == 0 and matrix_after.shape[0] == 0:
+        ret = [largest_block]
+    elif matrix_before.shape[0] == 0 and matrix_after.shape[0] != 0:
+        a =  [(x[0] + (largest_block[1] + 1), x[1] + (largest_block[1] + 1)) for x in find_blocks_indices(sim, matrix_after)]
+        ret = [largest_block] + a
+    elif matrix_before.shape[0] != 0  and matrix_after.shape[0] == 0:
+        ret = find_blocks_indices(sim, matrix_before) + [largest_block]
+    else:
+
+        a =  [(x[0] + (largest_block[1] + 1), x[1] + (largest_block[1] + 1)) for x in find_blocks_indices(sim, matrix_after)]
+        ret = find_blocks_indices(sim, matrix_before) + [largest_block] + a
+    
+    return ret
+
+def find_blocks_indices_old(matrix):
     n = matrix.shape[0]
     blocks = []
     start = 0
@@ -291,44 +330,101 @@ def find_blocks_indices(matrix):
             start = end
         else:
             start += 1
-            
     return blocks
 
+def get_model_size_and_memory(model):
+    # output model size and memory usage (in MB)
+    model_size = sum(p.numel() for p in model.parameters())
+    
+    param_size = 0
+    for param in model.parameters():
+        param_size += param.nelement() * param.element_size()
+    buffer_size = 0
+    for buffer in model.buffers():
+        buffer_size += buffer.nelement() * buffer.element_size()
+    model_memory = (param_size + buffer_size) / 1024**2
+    return model_size, model_memory
+
 def merge_layers(args, model, tokenizer, device=torch.device("cuda:0")):
-    original_size = get_model_size(model)
-    print(f"Original model size: {original_size:.2f} MB")
     if args.merge_ranges == 'auto':
         #TODO determine the merge ranges automatically
-        layer_similarity = get_layer_output_similarity(model, tokenizer, device)
+        layer_similarity = get_layer_output_similarity(model, tokenizer, device, dataset=args.calib_dataset, nsamples=args.nsamples)
         binarized_similarity = (layer_similarity > args.merge_thresh).astype(float)
-        # print(layer_similarity[:5, :5])
+        connected_layers = find_blocks_indices(layer_similarity, binarized_similarity)
+
+         # print(layer_similarity[:5, :5])
         # binarized_similarity_csr = csr_matrix(binarized_similarity)
         # _, connected_layers = connected_components(csgraph=binarized_similarity_csr, directed=False, return_labels=True)
-        connected_layers = find_blocks_indices(binarized_similarity)
+        # np.save("layer_similarity.npy", layer_similarity)
+
+
+        # connected_layers_old = []
+        # old_compression_ratio = 0
+        # # model = model.to('cpu')
+        # thresh_compression_ratio_dict = {}
+        # model = model.to('cpu')
+        # torch.cuda.empty_cache()
+        # for merge_thresh in np.arange(0.5, 1, 0.0125):
+        #     model_copy = copy.deepcopy(model)
+        #     binarized_similarity = (layer_similarity > merge_thresh).astype(float)
+       
+        #     connected_layers = find_blocks_indices(layer_similarity, binarized_similarity)
+        #     if connected_layers == connected_layers_old: continue
+        #     connected_layers_old = connected_layers
+        #     merge_ranges = [x for x in connected_layers if x[1] - x[0] >= args.min_block_size]
+            
+        #     _, compression_ratio = merge_from_ranges(args, model_copy, merge_ranges)
+        #     print(f'threshold: {merge_thresh}, compression ratio: {compression_ratio}')
+        #     thresh_compression_ratio_dict[merge_thresh] = (compression_ratio, merge_ranges)
+        #     # if compression_ratio >= args.target_compression_ratio and old_compression_ratio < args.target_compression_ratio:
+        #     #     break
+        #     old_compression_ratio = compression_ratio
+        # pickle.dump(thresh_compression_ratio_dict, open(f"thresh_compression_ratio_dict_{args.target_module_name}_{args.target_var}.pkl", "wb"))
+        
+        # var_compression_ratio_dict = {}
+        # binarized_similarity = (layer_similarity > args.merge_thresh).astype(float)
+        # connected_layers = find_blocks_indices(layer_similarity, binarized_similarity)
+        # merge_ranges = [x for x in connected_layers if x[1] - x[0] >= args.min_block_size]
+        # for target_var in [25, 50, 75]:
+        #     args.target_var = target_var
+        #     # if connected_layers == connected_layers_old: continu
+        #     model_copy = copy.deepcopy(model)
+        #     _, compression_ratio = merge_from_ranges(args, model_copy, merge_ranges)
+        #     print(f'target_var: {target_var}, compression ratio: {compression_ratio}')
+        #     var_compression_ratio_dict[target_var] = (compression_ratio, merge_ranges)
+        # pickle.dump(var_compression_ratio_dict, open("var_compression_ratio_dict.pkl", "wb"))
+
+        # assert 1==0
         print(connected_layers)
-        merge_ranges = [x for x in connected_layers if x[1] - x[0] > 0]
+        if not args.target_var: args.min_block_size = args.num_components
+        merge_ranges = [x for x in connected_layers if x[1] - x[0] >= args.min_block_size]
         # eval_ppl(args, model, tokenizer, device)
         # assert 1==0
     else:
         merge_ranges = [tuple(map(int, r.split('-'))) for r in args.merge_ranges]
+
     print(f"Merging layer ranges: {merge_ranges}")
+    model, compression_ratio = merge_from_ranges(args, model, merge_ranges)
     # assert 1==0
-    model = merge_multiple_ranges(model, merge_ranges, args.model_type, args.num_components)
-
-    print("Updating model configuration after merging...")
-    model = update_model_after_merge(model, args.model_type, merge_ranges, args.num_components)
-
-    merged_size = get_model_size(model)
-    print(f"Merged model size: {merged_size:.2f} MB")
-    print(f"Size reduction: {(original_size - merged_size) / original_size * 100:.2f}%")
     
-    return model
+    return model    
+
+def merge_from_ranges(args, model, merge_ranges):
+    original_size, original_memory = get_model_size_and_memory(model)
+    model, num_components_list = merge_multiple_ranges(model, merge_ranges, args.model_type, args.num_components, args.target_module_name, args.target_var)
+    print(f'num_components_list: {num_components_list}')
+    print("Updating model configuration after merging...")
+    model = update_model_after_merge(model, args.model_type, merge_ranges, num_components_list)
+    compressed_size, compressed_memory = get_model_size_and_memory(model)
+    return model, compressed_size / original_size
+    
+
 
 @torch.no_grad()
 def prune_sparsegpt(args, model, tokenizer, dev, prune_n=0, prune_m=0):
     ## SparseGPT code available at: https://github.com/IST-DASLab/sparsegpt/tree/f5c25005a61f96a0933ca2f95705a963585aafaa
     print('Starting ...')
-    dataloader, _ = get_loaders("c4",nsamples=args.nsamples,seed=args.seed,seqlen=model.seqlen,tokenizer=tokenizer)
+    dataloader, _ = get_loaders(args.calib_dataset,nsamples=args.nsamples,seed=args.seed,seqlen=model.seqlen,tokenizer=tokenizer)
 
     use_cache = model.config.use_cache
     model.config.use_cache = False

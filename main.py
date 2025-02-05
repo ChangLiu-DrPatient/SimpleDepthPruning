@@ -1,13 +1,14 @@
 
-import argparse, os, torch, json
+import argparse, os, torch, json, pickle
 import numpy as np
 from transformers import AutoTokenizer, AutoModelForCausalLM, AutoConfig
 from importlib.metadata import version
 
-from utils.prune import prune_wanda, prune_magnitude, prune_sparsegpt, prune_bonsai, prune_ablate, check_sparsity, merge_layers
+from utils.prune import prune_wanda, prune_magnitude, prune_sparsegpt, prune_bonsai, prune_ablate, check_sparsity, merge_layers, get_model_size_and_memory
 from utils.eval import eval_ppl, eval_zero_shot
 # bonsai
 from utils.lib.modelling_llama_mod import LlamaForCausalLM
+from calflops import calculate_flops
 
 print('torch', version('torch'))
 print('transformers', version('transformers'))
@@ -150,19 +151,6 @@ def get_nonzero_param_count(model, exclude=['embed', 'head']):
         if not any(x in n for x in exclude)
     ])
 
-def get_model_size_and_memory(model):
-    # output model size and memory usage (in MB)
-    model_size = sum(p.numel() for p in model.parameters())
-    
-    param_size = 0
-    for param in model.parameters():
-        param_size += param.nelement() * param.element_size()
-    buffer_size = 0
-    for buffer in model.buffers():
-        buffer_size += buffer.nelement() * buffer.element_size()
-    model_memory = (param_size + buffer_size) / 1024**2
-    return model_size, model_memory
-
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--model', default='meta-llama/Llama-2-7b-hf', type=str, help='LLaMA model')
@@ -170,9 +158,9 @@ def main():
     parser.add_argument('--nsamples', type=int, default=128, help='Number of calibration samples.')
     parser.add_argument('--sparsity_ratio', type=float, default=0.5, help='Sparsity level')
     parser.add_argument("--sparsity_type", type=str, default='unstructured', choices=["unstructured", "4:8", "2:4"])  # not for bonsai
-    parser.add_argument('--calib_dataset', type=str, default="c4", choices=["wikitext2", "c4"])
+    parser.add_argument('--calib_dataset', type=str, default="c4", choices=["wikitext2", "c4", "random"])
     parser.add_argument("--prune_method", default='merge', type=str, choices=["merge", "magnitude", "wanda", "sparsegpt", "bonsai",
-                        "ablate_mag_seq", "ablate_wanda_seq", "ablate_mag_iter", "ablate_wanda_iter", "search"])
+                        "ablate_mag_seq", "ablate_wanda_seq", "ablate_mag_iter", "ablate_wanda_iter", "search", "none"])
     #! --- for Bonsai starts
     parser.add_argument('--bonsai_prune_method', type=str, default="wanda", choices=["magnitude", "wanda", "random"])
     parser.add_argument('--tol', type=float, default=0.02, help="What level of tolerance close to the target sparsity to accept")
@@ -193,9 +181,16 @@ def main():
     #! --- for merging starts
     parser.add_argument("--model_type", choices=["opt", "llama", "gemma"], default="llama", help="Type of model to use")
     parser.add_argument("--merge_ranges", nargs="+", default='auto', help="Ranges of layers to merge, e.g., '2-12 14-17 18-19', or 'auto'")
-    parser.add_argument("--merge_thresh", type=float, default='0.8', help="Threshold for merging the layers")
+    parser.add_argument("--merge_thresh", type=float, default=None, help="Similarity threshold for merging the layers")
     parser.add_argument("--use_bfloat16", action="store_true", help="Use bfloat16 precision")
+    parser.add_argument("--min_block_size", type=int, default=1, help="Minimum size of the blocks to use for merging")
     parser.add_argument("--num_components", type=int, default=1, help="Number of principal components to use for merging")
+    parser.add_argument("--target_var", type=int, default=None, help="Target variance for merging")
+    parser.add_argument("--target_module_name", type=str, default='self_attn.k_proj',
+                        choices=['self_attn.k_proj', 'self_attn.v_proj', 'self_attn.q_proj', 'self_attn.o_proj', 
+                                 'mlp.gate_proj', 'mlp.up_proj', 'mlp.down_proj', 'input_layernorm', 'post_attention_layernorm'], 
+                        help='which module name to decide number of components')
+    parser.add_argument("--target_compression_ratio", type=float, default=0.5, help="target compression_ratio for the model")
     #! --- for merging ends
     
     parser.add_argument("--cache_dir", default="llm_weights", type=str )
@@ -209,6 +204,16 @@ def main():
     # Setting seeds for reproducibility
     np.random.seed(args.seed)
     torch.random.manual_seed(args.seed)
+
+    if not args.save_model:
+        if args.prune_method == "merge":
+            if args.target_var:
+                args.save_model = f'output/{args.prune_method}_{args.target_module_name}_{args.target_var}_{args.merge_thresh}_{args.calib_dataset}'
+            elif args.merge_ranges == 'auto':
+                args.save_model = f'output/{args.prune_method}_{args.num_components}_{args.merge_thresh}_{args.calib_dataset}'
+            else:
+                args.save_model = f'output/{args.prune_method}_{args.num_components}_{args.merge_ranges}'
+        else: args.save_model = f'output/{args.prune_method}'
 
     # Handling n:m sparsity
     prune_n, prune_m = 0, 0
@@ -227,35 +232,50 @@ def main():
         model = get_llm_bonsai(args.model, args.cache_dir)
     else:
         model = get_llm(args.model, args.cache_dir)
+        # model = AutoModelForCausalLM.from_pretrained(args.save_model, torch_dtype=torch.float16, low_cpu_mem_usage=True, device_map="auto")
         
-
-    
-
-    model.eval()
-    original_nozero_param_count = get_nonzero_param_count(model)
+        
     orig_size, orig_memory = get_model_size_and_memory(model)
-    tokenizer = AutoTokenizer.from_pretrained(args.model, use_fast=False)
+    original_nozero_param_count = get_nonzero_param_count(model)
+    model.eval()
 
     device = torch.device("cuda:0")
-    if "30b" in args.model or "65b" in args.model: # for 30b and 65b we use device_map to load onto multiple A6000 GPUs, thus the processing here.
-        device = model.hf_device_map["lm_head"]
-    print("use device ", device)
+    if os.path.exists(args.save_model) and args.prune_method != "none":
+        print(f"model already exists at {args.save_model}")
+        # torch empty cache
+        del model
+        torch.cuda.empty_cache()
+        model = AutoModelForCausalLM.from_pretrained(args.save_model, torch_dtype=torch.float16, low_cpu_mem_usage=True, device_map="auto")
+        tokenizer = AutoTokenizer.from_pretrained(args.save_model, use_fast=False)
+        model.seqlen = model.config.max_position_embeddings 
+    else:
+        os.makedirs(args.save_model, exist_ok=True)
+        tokenizer = AutoTokenizer.from_pretrained(args.model, use_fast=False)
 
-    if args.sparsity_ratio != 0:
-        print("pruning starts")
-        if args.prune_method == "merge":
-            model = merge_layers(args, model, tokenizer, device)
-        elif args.prune_method == "wanda":
-            prune_wanda(args, model, tokenizer, device, prune_n=prune_n, prune_m=prune_m)
-        elif args.prune_method == "magnitude":
-            prune_magnitude(args, model, tokenizer, device, prune_n=prune_n, prune_m=prune_m)
-        elif args.prune_method == "sparsegpt":
-            prune_sparsegpt(args, model, tokenizer, device, prune_n=prune_n, prune_m=prune_m)
-        elif args.prune_method == "bonsai":
-            prune_bonsai(args, model, tokenizer, device)
-        elif "ablate" in args.prune_method:
-            prune_ablate(args, model, tokenizer, device, prune_n=prune_n, prune_m=prune_m)
-    
+        if "30b" in args.model or "65b" in args.model: # for 30b and 65b we use device_map to load onto multiple A6000 GPUs, thus the processing here.
+            device = model.hf_device_map["lm_head"]
+        print("use device ", device)
+
+        if args.sparsity_ratio != 0:
+            print("pruning starts")
+            if args.prune_method == "merge":
+                model = merge_layers(args, model, tokenizer, device)
+            elif args.prune_method == "wanda":
+                prune_wanda(args, model, tokenizer, device, prune_n=prune_n, prune_m=prune_m)
+            elif args.prune_method == "magnitude":
+                prune_magnitude(args, model, tokenizer, device, prune_n=prune_n, prune_m=prune_m)
+            elif args.prune_method == "sparsegpt":
+                prune_sparsegpt(args, model, tokenizer, device, prune_n=prune_n, prune_m=prune_m)
+            elif args.prune_method == "bonsai":
+                prune_bonsai(args, model, tokenizer, device)
+                print(model)
+            elif "ablate" in args.prune_method:
+                prune_ablate(args, model, tokenizer, device, prune_n=prune_n, prune_m=prune_m)
+            elif args.prune_method == "none":
+                pass
+        #!
+        # model.save_pretrained(args.save_model)
+        # tokenizer.save_pretrained(args.save_model)
 
     compressed_size, compressed_memory = get_model_size_and_memory(model)
     print("*"*30)
@@ -276,29 +296,38 @@ def main():
     # ################################################################
     # ppl_test = eval_ppl(args, model, tokenizer, device)
     # print(f"wikitext perplexity {ppl_test}")
+    
+    #! calculate FLOPs
+    
+    # torch.cuda.empty_cache()
+    # model_cpu = model.to(torch.device('cpu')).float()
+    # flops, macs, params = calculate_flops(
+    # model=model_cpu,
+    # input_shape=(1, model.seqlen),
+    # transformer_tokenizer=tokenizer,
+    # print_results=False
+    # )
+    # print(f"FLOPs: {flops}, MACs: {macs}, Params: {params}")
 
-    # if not os.path.exists(args.save):
-    #     os.makedirs(args.save)
-    # save_filepath = os.path.join(args.save, f"log_{args.prune_method}.txt")
-    # with open(save_filepath, "w") as f:
-    #     print("method\tactual_sparsity\tppl_test", file=f, flush=True)
-    #     print(f"{args.prune_method}\t{sparsity_ratio:.4f}\t{ppl_test:.4f}", file=f, flush=True)
+
 
     if args.eval_zero_shot:
         accelerate=False
         if "30b" in args.model or "65b" in args.model or "70b" in args.model:
             accelerate=True
 
-        task_list = ['openbookqa', 'winogrande']#["boolq", "rte","hellaswag","winogrande", "arc_easy","arc_challenge", "openbookqa"]#["leaderboard"]#, 
+        task_list = ["leaderboard_short"]#["boolq", "rte","hellaswag","winogrande", "arc_easy","arc_challenge", "openbookqa"]#["leaderboard"]#, 
         num_shot = 0
+        torch.cuda.empty_cache()
         results = eval_zero_shot(args.model, model, tokenizer, task_list, num_shot, accelerate)
+
         print("********************************")
         print("zero_shot evaluation results")
-        print(results)
+        print(results['results'])
 
-    if args.save_model:
-        model.save_pretrained(args.save_model)
-        tokenizer.save_pretrained(args.save_model)
+        with open(f'{args.save_model}/results.pkl', 'wb') as f:
+            pickle.dump(results['results'], f)
+
 
 if __name__ == '__main__':
     main()

@@ -23,18 +23,16 @@ def cosine_similarity_matrix(A):
     return similarity
 
 # TODO Function to get layer-wise output of the model using the eval_ppl datasets.
-def get_layer_output_similarity(model, tokenizer, device=torch.device("cuda:0"), dataset="c4", bsz=1):
+def get_layer_output_similarity(model, tokenizer, device=torch.device("cuda:0"), dataset="c4", nsamples=32, bsz=1):
 	
     # Print status
     print(f"fetching layer outputs on {dataset}")
 
     # Get the test loader
-    trainloader, _ = get_loaders(
-        dataset, seed=0, seqlen=model.seqlen, tokenizer=tokenizer 
-    )
-
-    nsamples = len(trainloader)
-    nsamples = 16  #!
+    if dataset != 'random':
+        trainloader, _ = get_loaders(
+            dataset, seed=0, seqlen=model.seqlen, tokenizer=tokenizer, nsamples=nsamples 
+        )
 
     # List to store negative log likelihoods
     # nsamples = 1
@@ -65,9 +63,13 @@ def get_layer_output_similarity(model, tokenizer, device=torch.device("cuda:0"),
             # Prepare inputs and move to device
             # inputs = testenc[:,(i * model.seqlen):(j * model.seqlen)].to(device)
             this_bs = min(bsz, nsamples - i)
-            inputs = torch.concat([trainloader[i + k][0].to(device) for k in range(this_bs)])
-
-            inputs = inputs.reshape(j-i, model.seqlen)
+            if dataset == 'random':
+                inputs = torch.randint(low=0, high=model.config.vocab_size, size=(j-i, model.seqlen)).to(device)
+            else:
+                inputs = torch.concat([trainloader[i + k][0].to(device) for k in range(this_bs)])
+                # print(inputs)
+                # assert 1==0
+                inputs = inputs.reshape(j-i, model.seqlen)
 
             # Forward pass through the model
             outputs = model(inputs)
@@ -75,7 +77,7 @@ def get_layer_output_similarity(model, tokenizer, device=torch.device("cuda:0"),
             similarity = cosine_similarity_matrix(np.stack(features, axis=0))
             similarities.append(similarity)
 
-        torch.cuda.empty_cache()
+        # torch.cuda.empty_cache()
         # print(features)
 
 
@@ -178,6 +180,8 @@ def eval_ppl_wikitext(model, testenc, bs=1, device=None):
         inputs = inputs.reshape(j-i, model.seqlen)
 
         # Forward pass through the model
+        # print(inputs.shape)
+        # assert 1==0
         lm_logits = model(inputs).logits
 
         # Shift logits and labels for next token prediction
@@ -214,7 +218,10 @@ def eval_zero_shot(model_name, model, tokenizer, task_list=["boolq","rte","hella
         return list(task_names)
     task_manager = tasks.TaskManager()
     task_names = pattern_match(task_list, task_manager.all_tasks)
-    print(task_names)
+    # print(task_names)
+    # assert 1==0
+    # print(task_names)
+    # assert 1==0
     
     limit = None 
     if "70b" in model_name or "65b" in model_name:
@@ -224,7 +231,8 @@ def eval_zero_shot(model_name, model, tokenizer, task_list=["boolq","rte","hella
         # model_args = f"pretrained={model_name},cache_dir=./llm_weights,use_accelerate=True"
     model_args={"pretrained":model, "cache_dir":"./llm_weights", "use_accelerate":use_accelerate, 
                 "add_special_tokens":add_special_tokens, "tokenizer":tokenizer}
-        
+    start_time = time.time()
+    print(next(model.parameters()).device)
     results = evaluator.simple_evaluate(
         # model="hf-causal-experimental",
         model='hf-auto',
@@ -241,5 +249,6 @@ def eval_zero_shot(model_name, model, tokenizer, task_list=["boolq","rte","hella
         # pretrained_model=model,
         # add_special_tokens=add_special_tokens
     )
-
+    elapse = time.time() - start_time
+    print(f'Time elapsed in hours: {elapse/3600 :.3f}')
     return results 
