@@ -4,7 +4,7 @@ import numpy as np
 from transformers import AutoTokenizer, AutoModelForCausalLM, AutoConfig
 from importlib.metadata import version
 
-from utils.prune import prune_wanda, prune_magnitude, prune_sparsegpt, prune_bonsai, prune_ablate, check_sparsity, merge_layers, get_model_size_and_memory
+from utils.prune import prune_wanda, prune_magnitude, prune_sparsegpt, prune_shortened_llm, prune_bonsai, prune_ablate, check_sparsity, merge_layers, get_model_size_and_memory
 from utils.eval import eval_ppl, eval_zero_shot
 # bonsai
 from utils.lib.modelling_llama_mod import LlamaForCausalLM
@@ -118,6 +118,7 @@ def load_model_with_rope_scaling_adjustment(model_name, cache_dir='llm_weights',
     model.seqlen = model.config.max_position_embeddings 
     return model
 
+
 def get_llm(model_name, cache_dir="llm_weights"):
     model = AutoModelForCausalLM.from_pretrained(
         model_name, 
@@ -128,20 +129,11 @@ def get_llm(model_name, cache_dir="llm_weights"):
     )
 
     model.seqlen = model.config.max_position_embeddings 
+    print(model.seqlen)
+    model.seqlen = min(4096, model.seqlen)
+    print(model.seqlen)
     return model
 
-def get_llm_bonsai(model_name, cache_dir="llm_weights"):
-	model = LlamaForCausalLM.from_pretrained(
-		model_name, 
-		torch_dtype=torch.float16, 
-		cache_dir=cache_dir, 
-		low_cpu_mem_usage=True, 
-		device_map="auto"
-	)
-	model.seqlen = model.config.max_position_embeddings 
-	if ('13b' in model_name) or ('65b' in model_name):
-		model.seqlen = 2048 #Based on the values from the Lora-prune paper
-	return model
 
 def get_nonzero_param_count(model, exclude=['embed', 'head']):
     #! unified sparsity calculation
@@ -151,15 +143,16 @@ def get_nonzero_param_count(model, exclude=['embed', 'head']):
         if not any(x in n for x in exclude)
     ])
 
+
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument('--model', default='meta-llama/Llama-2-7b-hf', type=str, help='LLaMA model')
+    parser.add_argument('--model', default='meta-llama/llama-3.1-8b', type=str, help='LLaMA model')
     parser.add_argument('--seed', type=int, default=0, help='Seed for sampling the calibration data.')
     parser.add_argument('--nsamples', type=int, default=128, help='Number of calibration samples.')
     parser.add_argument('--sparsity_ratio', type=float, default=0.5, help='Sparsity level')
     parser.add_argument("--sparsity_type", type=str, default='unstructured', choices=["unstructured", "4:8", "2:4"])  # not for bonsai
-    parser.add_argument('--calib_dataset', type=str, default="c4", choices=["wikitext2", "c4", "random"])
-    parser.add_argument("--prune_method", default='merge', type=str, choices=["merge", "magnitude", "wanda", "sparsegpt", "bonsai",
+    parser.add_argument('--calib_dataset', type=str, default="wikitext2", choices=["wikitext2", "c4", "bookcorpus", "random"])
+    parser.add_argument("--prune_method", default='merge', type=str, choices=["merge", "magnitude", "wanda", "sparsegpt", "shortened_llm", "bonsai",
                         "ablate_mag_seq", "ablate_wanda_seq", "ablate_mag_iter", "ablate_wanda_iter", "search", "none"])
     #! --- for Bonsai starts
     parser.add_argument('--bonsai_prune_method', type=str, default="wanda", choices=["magnitude", "wanda", "random"])
@@ -186,7 +179,7 @@ def main():
     parser.add_argument("--min_block_size", type=int, default=1, help="Minimum size of the blocks to use for merging")
     parser.add_argument("--num_components", type=int, default=1, help="Number of principal components to use for merging")
     parser.add_argument("--target_var", type=int, default=None, help="Target variance for merging")
-    parser.add_argument("--target_module_name", type=str, default='self_attn.k_proj',
+    parser.add_argument("--target_module_name", type=str, default='input_layernorm',
                         choices=['self_attn.k_proj', 'self_attn.v_proj', 'self_attn.q_proj', 'self_attn.o_proj', 
                                  'mlp.gate_proj', 'mlp.up_proj', 'mlp.down_proj', 'input_layernorm', 'post_attention_layernorm'], 
                         help='which module name to decide number of components')
@@ -195,25 +188,39 @@ def main():
     
     parser.add_argument("--cache_dir", default="llm_weights", type=str )
     parser.add_argument('--use_variant', action="store_true", help="whether to use the wanda variant described in the appendix")
-    parser.add_argument('--save', type=str, default='output', help='Path to save results.')
+    # parser.add_argument('--save', type=str, default='output', help='Path to save results.')
     parser.add_argument('--save_model', type=str, default=None, help='Path to save the pruned model.')
 
     parser.add_argument("--eval_zero_shot", action="store_true")
     args = parser.parse_args()
+    calib_action = next(action for action in parser._actions if action.dest == 'calib_dataset')
+    calib_choices = calib_action.choices
+    if 'random' in calib_choices:
+        calib_choices.remove('random')
 
     # Setting seeds for reproducibility
     np.random.seed(args.seed)
     torch.random.manual_seed(args.seed)
 
+    save_root = f'output/{args.model.split("/")[-1]}'
+
     if not args.save_model:
         if args.prune_method == "merge":
-            if args.target_var:
-                args.save_model = f'output/{args.prune_method}_{args.target_module_name}_{args.target_var}_{args.merge_thresh}_{args.calib_dataset}'
-            elif args.merge_ranges == 'auto':
-                args.save_model = f'output/{args.prune_method}_{args.num_components}_{args.merge_thresh}_{args.calib_dataset}'
+            if args.merge_ranges == 'auto':
+                if args.target_var:
+                    args.save_model = f'{save_root}/{args.prune_method}_{args.target_var}_{args.merge_thresh}'
+                else:
+                    args.save_model = f'{save_root}/{args.prune_method}_{args.num_components}_{args.merge_thresh}'
             else:
-                args.save_model = f'output/{args.prune_method}_{args.num_components}_{args.merge_ranges}'
-        else: args.save_model = f'output/{args.prune_method}'
+                if args.target_var:
+                    args.save_model = f'{save_root}/{args.prune_method}_{args.target_var}_{args.merge_ranges}'
+                else:
+                    args.save_model = f'{save_root}/{args.prune_method}_{args.num_components}_{args.merge_ranges}'
+        elif args.prune_method == "shortened_llm":
+            args.save_model = f'{save_root}/{args.prune_method}_{args.num_components}'
+        elif args.prune_method == 'none':
+            args.save_model = f'{save_root}/{args.prune_method}'
+        else: args.save_model = f'{save_root}/{args.prune_method}_{args.sparsity_ratio}'
 
     # Handling n:m sparsity
     prune_n, prune_m = 0, 0
@@ -224,23 +231,24 @@ def main():
     model_name = args.model.split("/")[-1]
     print(f"loading llm model {args.model}")
 
-    if args.prune_method == 'merge':
-        model = load_model_with_rope_scaling_adjustment(args.model, args.cache_dir, use_bfloat16=args.use_bfloat16)
+    # if args.prune_method == 'merge':
+    #     model = load_model_with_rope_scaling_adjustment(args.model, args.cache_dir, use_bfloat16=args.use_bfloat16)
         # model = get_llm(args.model, args.cache_dir)
         # assert 1==0
-    elif args.prune_method == 'bonsai':
-        model = get_llm_bonsai(args.model, args.cache_dir)
-    else:
-        model = get_llm(args.model, args.cache_dir)
         # model = AutoModelForCausalLM.from_pretrained(args.save_model, torch_dtype=torch.float16, low_cpu_mem_usage=True, device_map="auto")
         
-        
+    model = get_llm(args.model, args.cache_dir)
+    if args.calib_dataset == "bookcorpus": model.seqlen = 128
+    tokenizer = AutoTokenizer.from_pretrained(args.model, use_fast=False)
+    device = torch.device("cuda:0")
+    # ppl_train,ppl_test = eval_ppl(model, tokenizer, seed=args.seed, device=device, nsamples=8, dataset=args.calib_dataset)
+    # print(f'{args.calib_dataset} perplexity Train {ppl_train} Test {ppl_test}')
     orig_size, orig_memory = get_model_size_and_memory(model)
     original_nozero_param_count = get_nonzero_param_count(model)
     model.eval()
 
-    device = torch.device("cuda:0")
-    if os.path.exists(args.save_model) and args.prune_method != "none":
+    
+    if os.path.isfile(os.path.abspath(os.path.join(args.save_model, 'config.json'))) and args.prune_method != "none":
         print(f"model already exists at {args.save_model}")
         # torch empty cache
         del model
@@ -250,7 +258,7 @@ def main():
         model.seqlen = model.config.max_position_embeddings 
     else:
         os.makedirs(args.save_model, exist_ok=True)
-        tokenizer = AutoTokenizer.from_pretrained(args.model, use_fast=False)
+        
 
         if "30b" in args.model or "65b" in args.model: # for 30b and 65b we use device_map to load onto multiple A6000 GPUs, thus the processing here.
             device = model.hf_device_map["lm_head"]
@@ -266,16 +274,18 @@ def main():
                 prune_magnitude(args, model, tokenizer, device, prune_n=prune_n, prune_m=prune_m)
             elif args.prune_method == "sparsegpt":
                 prune_sparsegpt(args, model, tokenizer, device, prune_n=prune_n, prune_m=prune_m)
+            elif args.prune_method == "shortened_llm":
+                model = prune_shortened_llm(args, model, tokenizer, device)
             elif args.prune_method == "bonsai":
                 prune_bonsai(args, model, tokenizer, device)
-                print(model)
+                # print(model)
             elif "ablate" in args.prune_method:
                 prune_ablate(args, model, tokenizer, device, prune_n=prune_n, prune_m=prune_m)
             elif args.prune_method == "none":
                 pass
         #!
-        # model.save_pretrained(args.save_model)
-        # tokenizer.save_pretrained(args.save_model)
+        model.save_pretrained(args.save_model)
+        tokenizer.save_pretrained(args.save_model)
 
     compressed_size, compressed_memory = get_model_size_and_memory(model)
     print("*"*30)
@@ -292,11 +302,15 @@ def main():
     sparsity_ratio_unified = 1 - cur_nozero_param_count / original_nozero_param_count
     print(f"sparsity unified {sparsity_ratio_unified:.4f}")
     print("*"*30)
-    # assert 1==0
+    assert 1==0
     # ################################################################
     # ppl_test = eval_ppl(args, model, tokenizer, device)
+    perplexity_results = {}
+    for calib_dataset in calib_choices:
+        ppl_train, ppl_test = eval_ppl(model, tokenizer, seed=args.seed, device=device, nsamples=8, dataset=calib_dataset)
+        perplexity_results[calib_dataset] = {'train': ppl_train, 'test': ppl_test}
+        print(f'{calib_dataset} perplexity Train {ppl_train} Test {ppl_test}')
     # print(f"wikitext perplexity {ppl_test}")
-    
     #! calculate FLOPs
     
     # torch.cuda.empty_cache()
@@ -320,13 +334,14 @@ def main():
         num_shot = 0
         torch.cuda.empty_cache()
         results = eval_zero_shot(args.model, model, tokenizer, task_list, num_shot, accelerate)
-
+        results_dict = results['results']
+        results_dict['perplexity'] = perplexity_results
         print("********************************")
         print("zero_shot evaluation results")
-        print(results['results'])
+        print(results_dict)
 
         with open(f'{args.save_model}/results.pkl', 'wb') as f:
-            pickle.dump(results['results'], f)
+            pickle.dump(results_dict, f)
 
 
 if __name__ == '__main__':

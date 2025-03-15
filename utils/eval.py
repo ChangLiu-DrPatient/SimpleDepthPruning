@@ -85,126 +85,145 @@ def get_layer_output_similarity(model, tokenizer, device=torch.device("cuda:0"),
     return mean_similarities
 	# return train_outputs
 
+
 # Function to evaluate perplexity (ppl) on a specified model and tokenizer
-def eval_ppl(args, model, tokenizer, device=torch.device("cuda:0")):
-    # Set dataset
-    dataset = "wikitext2"
-    print(type(model))
+def eval_ppl(model, tokenizer, seed=0, nsamples=32, device=torch.device("cuda:0"), dataset="wikitext2", bsz=1):
 
-    # Print status
+	# Print status
     print(f"evaluating on {dataset}")
+    if dataset == 'bookcorpus': seqlen = 128
+    else: seqlen = model.seqlen
+	# Get the test loader
+    trainloader, testloader = get_loaders(
+		dataset, nsamples=nsamples, seed=seed, seqlen=seqlen, tokenizer=tokenizer 
+	)
 
+	# Evaluate ppl in no grad context to avoid updating the model
+    with torch.no_grad():
+        ppl_test = eval_ppl_test(model, testloader, bsz, device, seqlen)
+        ppl_train = eval_ppl_train(model, trainloader, bsz, device, seqlen)
+    return ppl_train, ppl_test 
+
+
+# Function to evaluate perplexity (ppl) on a specified model and tokenizer
+def eval_ppl_trainonly(model, tokenizer, bsz=1, nsamples=128, device=torch.device("cuda:0"), seed=0, dataset="wikitext2"):
+
+    print(f"evaluating on {dataset}")
+    if dataset == 'bookcorpus': seqlen = 128
+    else: seqlen = model.seqlen
     # Get the test loader
-    _, testloader = get_loaders(
-        dataset, seed=0, seqlen=model.seqlen, tokenizer=tokenizer 
+    trainloader, _ = get_loaders(
+        dataset, nsamples=nsamples, seed=seed, seqlen=seqlen, tokenizer=tokenizer 
     )
 
     # Evaluate ppl in no grad context to avoid updating the model
     with torch.no_grad():
-        ppl_test = eval_ppl_wikitext(model, testloader, 1, device)
-    return ppl_test 
+        ppl_train = eval_ppl_train(model, trainloader, bsz, device, seqlen)
+    return ppl_train
+
 
 # Function to evaluate perplexity (ppl) specifically on the wikitext dataset
-def eval_ppl_wikitext_train(model, trainloader, bs=1, device=None):
-    # Get input IDs
-    # testenc = testenc.input_ids
+def eval_ppl_train(model, trainloader, bs=1, device=None, seqlen=128):
+	# Get input IDs
+	# testenc = testenc.input_ids
 
-    # Calculate number of samples
-    # nsamples = testenc.numel() // model.seqlen
-    nsamples = len(trainloader)
+	# Calculate number of samples
+	# nsamples = testenc.numel() // seqlen
+	nsamples = len(trainloader)
 
-    # List to store negative log likelihoods
-    nlls = []
-    print(f"nsamples {nsamples}")
+	# List to store negative log likelihoods
+	nlls = []
+	print(f"nsamples {nsamples}")
 
-    # Loop through each batch
-    for i in range(0,nsamples,bs):
-        if i % 50 == 0:
-            print(f"sample {i}")
+	# Loop through each batch
+	for i in range(0,nsamples,bs):
+		if i % 50 == 0:
+			print(f"sample {i}")
 
-        # Calculate end index
-        j = min(i+bs, nsamples)
+		# Calculate end index
+		j = min(i+bs, nsamples)
 
-        # Prepare inputs and move to device
-        # inputs = testenc[:,(i * model.seqlen):(j * model.seqlen)].to(device)
-        inputs = trainloader[i][0].to(device)
-        inputs = inputs.reshape(j-i, model.seqlen)
+		# Prepare inputs and move to device
+		# inputs = testenc[:,(i * seqlen):(j * seqlen)].to(device)
+		this_bs = min(bs, nsamples - i)
+		inputs = torch.concat([trainloader[i + k][0].to(device) for k in range(this_bs)])
 
-        # Forward pass through the model
-        lm_logits = model(inputs).logits
+		inputs = inputs.reshape(j-i, seqlen)
 
-        # Shift logits and labels for next token prediction
-        shift_logits = lm_logits[:, :-1, :].contiguous()
-        shift_labels = inputs[:, 1:]
+		# Forward pass through the model
+		lm_logits = model(inputs).logits
 
-        # Compute loss
-        loss_fct = nn.CrossEntropyLoss()
-        loss = loss_fct(shift_logits.reshape(-1, shift_logits.size(-1)), shift_labels.reshape(-1))
+		# Shift logits and labels for next token prediction
+		shift_logits = lm_logits[:, :-1, :].contiguous()
+		shift_labels = inputs[:, 1:]
 
-        # Calculate negative log likelihood
-        neg_log_likelihood = loss.float() * model.seqlen * (j-i)
+		# Compute loss
+		loss_fct = nn.CrossEntropyLoss()
+		loss = loss_fct(shift_logits.reshape(-1, shift_logits.size(-1)), shift_labels.reshape(-1))
 
-        # Append to list of negative log likelihoods
-        nlls.append(neg_log_likelihood)
+		# Calculate negative log likelihood
+		neg_log_likelihood = loss.float() * (seqlen - 1) * (j-i)
 
-    # Compute perplexity
-    ppl = torch.exp(torch.stack(nlls).sum() / (nsamples * model.seqlen))
+		# Append to list of negative log likelihoods
+		nlls.append(neg_log_likelihood)
 
-    # Empty CUDA cache to save memory
-    torch.cuda.empty_cache()
+	# Compute perplexity
+	ppl = torch.exp(torch.stack(nlls).sum() / (nsamples * (seqlen - 1)))
 
-    return ppl.item()
+	# Empty CUDA cache to save memory
+	torch.cuda.empty_cache()
+
+	return ppl.item()
+
 
 # Function to evaluate perplexity (ppl) specifically on the wikitext dataset
-def eval_ppl_wikitext(model, testenc, bs=1, device=None):
-    # Get input IDs
-    testenc = testenc.input_ids
+def eval_ppl_test(model, testenc, bs=1, device=None, seqlen=128):
+	# Get input IDs
+	testenc = testenc.input_ids
 
-    # Calculate number of samples
-    nsamples = testenc.numel() // model.seqlen
+	# Calculate number of samples
+	nsamples = testenc.numel() // seqlen
 
-    # List to store negative log likelihoods
-    nlls = []
-    print(f"nsamples {nsamples}")
+	# List to store negative log likelihoods
+	nlls = []
+	print(f"nsamples {nsamples}")
 
-    # Loop through each batch
-    for i in range(0,nsamples,bs):
-        if i % 50 == 0:
-            print(f"sample {i}")
+	# Loop through each batch
+	for i in range(0,nsamples,bs):
+		if i % 50 == 0:
+			print(f"sample {i}")
 
-        # Calculate end index
-        j = min(i+bs, nsamples)
+		# Calculate end index
+		j = min(i+bs, nsamples)
 
-        # Prepare inputs and move to device
-        inputs = testenc[:,(i * model.seqlen):(j * model.seqlen)].to(device)
-        inputs = inputs.reshape(j-i, model.seqlen)
+		# Prepare inputs and move to device
+		inputs = testenc[:,(i * seqlen):(j * seqlen)].to(device)
+		inputs = inputs.reshape(j-i, seqlen)
 
-        # Forward pass through the model
-        # print(inputs.shape)
-        # assert 1==0
-        lm_logits = model(inputs).logits
+		# Forward pass through the model
+		lm_logits = model(inputs).logits
 
-        # Shift logits and labels for next token prediction
-        shift_logits = lm_logits[:, :-1, :].contiguous()
-        shift_labels = inputs[:, 1:]
+		# Shift logits and labels for next token prediction
+		shift_logits = lm_logits[:, :-1, :].contiguous()
+		shift_labels = inputs[:, 1:]
 
-        # Compute loss
-        loss_fct = nn.CrossEntropyLoss()
-        loss = loss_fct(shift_logits.reshape(-1, shift_logits.size(-1)), shift_labels.reshape(-1))
+		# Compute loss
+		loss_fct = nn.CrossEntropyLoss()
+		loss = loss_fct(shift_logits.reshape(-1, shift_logits.size(-1)), shift_labels.reshape(-1))
 
-        # Calculate negative log likelihood
-        neg_log_likelihood = loss.float() * model.seqlen * (j-i)
+		# Calculate negative log likelihood
+		neg_log_likelihood = loss.float() * (seqlen - 1) * (j-i)
 
-        # Append to list of negative log likelihoods
-        nlls.append(neg_log_likelihood)
+		# Append to list of negative log likelihoods
+		nlls.append(neg_log_likelihood)
 
-    # Compute perplexity
-    ppl = torch.exp(torch.stack(nlls).sum() / (nsamples * model.seqlen))
+	# Compute perplexity
+	ppl = torch.exp(torch.stack(nlls).sum() / (nsamples * (seqlen - 1)))
 
-    # Empty CUDA cache to save memory
-    torch.cuda.empty_cache()
+	# Empty CUDA cache to save memory
+	torch.cuda.empty_cache()
 
-    return ppl.item()
+	return ppl.item()
 
 
 def eval_zero_shot(model_name, model, tokenizer, task_list=["boolq","rte","hellaswag","winogrande","arc_challenge","arc_easy","openbookqa"], 
@@ -232,7 +251,8 @@ def eval_zero_shot(model_name, model, tokenizer, task_list=["boolq","rte","hella
     model_args={"pretrained":model, "cache_dir":"./llm_weights", "use_accelerate":use_accelerate, 
                 "add_special_tokens":add_special_tokens, "tokenizer":tokenizer}
     start_time = time.time()
-    print(next(model.parameters()).device)
+    # print(next(model.parameters()).device)
+    
     results = evaluator.simple_evaluate(
         # model="hf-causal-experimental",
         model='hf-auto',

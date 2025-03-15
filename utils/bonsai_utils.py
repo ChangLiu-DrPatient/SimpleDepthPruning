@@ -8,7 +8,7 @@ import pdb
 from time import time
 import datetime
 from .lib.modelling_llama_mod import LlamaForCausalLM
-from .lib.eval import eval_ppl, eval_ppl_trainonly
+from .eval import eval_ppl, eval_ppl_trainonly
 from collections import defaultdict
 import pickle as pkl
 import random
