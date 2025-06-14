@@ -9,6 +9,7 @@ from .bonsai_utils import *
 from .ablate import AblateGPT 
 from .layer_merging import *
 from .eval import get_layer_output_similarity, eval_ppl_train
+from sklearn_extra.cluster import KMedoids
 # from scipy.sparse.csgraph import connected_components
 # from scipy.sparse import csr_matrix
 
@@ -314,7 +315,7 @@ def prune_shortened_llm(args, model, tokenizer, device=torch.device("cuda:0"), s
     else:
         print("loading calibration data")
         dataloader, _ = get_loaders(args.calib_dataset,nsamples=args.nsamples,seed=args.seed,seqlen=model.seqlen,tokenizer=tokenizer)
-        ppl = eval_ppl_train(model, dataloader, bs=1, device=device)
+        ppl = eval_ppl_train(model, dataloader, bs=1, device=device, seqlen=model.seqlen)
         print(f"original ppl {ppl}\n")
         layers = model.model.layers
         unsorted_results = []
@@ -689,49 +690,6 @@ def merge_layers(args, model, tokenizer, device=torch.device("cuda:0")):
         binarized_similarity = (layer_similarity > args.merge_thresh).astype(float)
         connected_layers = find_blocks_indices(layer_similarity, binarized_similarity)
 
-         # print(layer_similarity[:5, :5])
-        # binarized_similarity_csr = csr_matrix(binarized_similarity)
-        # _, connected_layers = connected_components(csgraph=binarized_similarity_csr, directed=False, return_labels=True)
-        # np.save("layer_similarity.npy", layer_similarity)
-
-
-        # connected_layers_old = []
-        # old_compression_ratio = 0
-        # # model = model.to('cpu')
-        # thresh_compression_ratio_dict = {}
-        # model = model.to('cpu')
-        # torch.cuda.empty_cache()
-        # for merge_thresh in np.arange(0.5, 1, 0.0125):
-        #     model_copy = copy.deepcopy(model)
-        #     binarized_similarity = (layer_similarity > merge_thresh).astype(float)
-       
-        #     connected_layers = find_blocks_indices(layer_similarity, binarized_similarity)
-        #     if connected_layers == connected_layers_old: continue
-        #     connected_layers_old = connected_layers
-        #     merge_ranges = [x for x in connected_layers if x[1] - x[0] >= args.min_block_size]
-            
-        #     _, compression_ratio = merge_from_ranges(args, model_copy, merge_ranges)
-        #     print(f'threshold: {merge_thresh}, compression ratio: {compression_ratio}')
-        #     thresh_compression_ratio_dict[merge_thresh] = (compression_ratio, merge_ranges)
-        #     # if compression_ratio >= args.target_compression_ratio and old_compression_ratio < args.target_compression_ratio:
-        #     #     break
-        #     old_compression_ratio = compression_ratio
-        # pickle.dump(thresh_compression_ratio_dict, open(f"thresh_compression_ratio_dict_{args.target_module_name}_{args.target_var}.pkl", "wb"))
-        
-        # var_compression_ratio_dict = {}
-        # binarized_similarity = (layer_similarity > args.merge_thresh).astype(float)
-        # connected_layers = find_blocks_indices(layer_similarity, binarized_similarity)
-        # merge_ranges = [x for x in connected_layers if x[1] - x[0] >= args.min_block_size]
-        # for target_var in [25, 50, 75]:
-        #     args.target_var = target_var
-        #     # if connected_layers == connected_layers_old: continu
-        #     model_copy = copy.deepcopy(model)
-        #     _, compression_ratio = merge_from_ranges(args, model_copy, merge_ranges)
-        #     print(f'target_var: {target_var}, compression ratio: {compression_ratio}')
-        #     var_compression_ratio_dict[target_var] = (compression_ratio, merge_ranges)
-        # pickle.dump(var_compression_ratio_dict, open("var_compression_ratio_dict.pkl", "wb"))
-
-        # assert 1==0
         print(connected_layers)
         if not args.target_var: args.min_block_size = args.num_components
         merge_ranges = [x for x in connected_layers if x[1] - x[0] >= args.min_block_size]
@@ -755,3 +713,66 @@ def merge_from_ranges(args, model, merge_ranges):
     model = update_model_after_merge(model, args.model_type, merge_ranges, num_components_list)
     compressed_size, compressed_memory = get_model_size_and_memory(model)
     return model, compressed_size / original_size
+
+#! new method: k-medioids 
+def select_layers(args, model):
+    original_size, original_memory = get_model_size_and_memory(model)
+    prune_ranges = [tuple(map(int, r.split('-'))) for r in args.merge_ranges]
+    
+    keep_num_layers_list = []
+    for start, end in prune_ranges:
+        model, selected_layers = determine_k_layers_by_module_name(model, start, end, args.num_components, args.target_module_name)
+        print(f'selected_layers: {[start + x for x in selected_layers]}')
+        keep_num_layers_list.append(len(selected_layers))
+    # print(f'keep_num_layers_list: {keep_num_layers_list}')
+    print("Updating model configuration after merging...")
+    model = update_model_after_merge(model, args.model_type, prune_ranges, keep_num_layers_list)
+    # compressed_size, compressed_memory = get_model_size_and_memory(model)
+    return model#, compressed_size / original_size
+
+
+def determine_k_layers_by_module_name(model, start_layer, end_layer, k, target_module_name):
+    layers = model.model.layers
+    all_module_names = ['self_attn.k_proj', 'self_attn.v_proj', 'self_attn.q_proj', 'self_attn.o_proj', 
+                    'mlp.gate_proj', 'mlp.up_proj', 'mlp.down_proj', 'input_layernorm', 'post_attention_layernorm']
+    all_module_names.insert(0, all_module_names.pop(all_module_names.index(target_module_name)))   # move the target module to the front
+    for module_name in all_module_names:
+        try:
+            weight_params = [getattr(layers[i], module_name.split('.')[0])
+                    if '.' not in module_name else
+                    getattr(getattr(layers[i], module_name.split('.')[0]), module_name.split('.')[1])
+                    for i in range(start_layer, end_layer + 1)]
+            
+            weight_data = [p.weight.data for p in weight_params if hasattr(p, 'weight')]
+            if module_name == target_module_name:
+                selected_weights, selected_layers = k_medoids_on_weights(weight_data, k)
+            else:
+            
+                selected_weights = [weight_data[x] for x in selected_layers]
+                
+            if hasattr(weight_params[0], 'bias') and weight_params[0].bias is not None:
+                bias_data = [p.bias.data for p in weight_params]
+                selected_biases = [bias_data[x] for x in selected_layers]
+
+            for i, selected_weight in enumerate(selected_weights):
+                if '.' in module_name:
+                    getattr(getattr(layers[start_layer + i], module_name.split('.')[0]), module_name.split('.')[1]).weight.data = selected_weight
+                    if hasattr(weight_params[0], 'bias') and weight_params[0].bias is not None:
+                        getattr(getattr(layers[start_layer + i], module_name.split('.')[0]), module_name.split('.')[1]).bias.data = selected_biases[i]
+                else:
+                    getattr(layers[start_layer + i], module_name).weight.data = selected_weight
+                    if hasattr(weight_params[0], 'bias') and weight_params[0].bias is not None:
+                        getattr(layers[start_layer + i], module_name).bias.data = selected_biases[i]
+        except AttributeError:
+            print(f"Skipping {module_name} as it's not present in this model architecture.")
+    
+    return model, selected_layers
+
+
+def k_medoids_on_weights(weights, k):
+    # use sklearn_extra's KMedoids to find k layers to keep
+    weight_data = [w.detach().cpu().flatten().numpy() for w in weights]
+    kmedoids = KMedoids(n_clusters=k, random_state=30).fit(weight_data)
+    selected_layers = sorted(kmedoids.medoid_indices_)
+    selected_weights = [weights[i] for i in selected_layers]
+    return selected_weights, selected_layers

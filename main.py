@@ -4,7 +4,7 @@ import numpy as np
 from transformers import AutoTokenizer, AutoModelForCausalLM, AutoConfig
 from importlib.metadata import version
 
-from utils.prune import prune_wanda, prune_magnitude, prune_sparsegpt, prune_shortened_llm, prune_bonsai, prune_ablate, check_sparsity, merge_layers, get_model_size_and_memory
+from utils.prune import prune_wanda, prune_magnitude, prune_sparsegpt, prune_shortened_llm, prune_bonsai, prune_ablate, check_sparsity, merge_layers, select_layers, get_model_size_and_memory
 from utils.eval import eval_ppl, eval_zero_shot
 # bonsai
 from utils.lib.modelling_llama_mod import LlamaForCausalLM
@@ -151,8 +151,8 @@ def main():
     parser.add_argument('--nsamples', type=int, default=128, help='Number of calibration samples.')
     parser.add_argument('--sparsity_ratio', type=float, default=0.5, help='Sparsity level')
     parser.add_argument("--sparsity_type", type=str, default='unstructured', choices=["unstructured", "4:8", "2:4"])  # not for bonsai
-    parser.add_argument('--calib_dataset', type=str, default="wikitext2", choices=["wikitext2", "c4", "bookcorpus", "random"])
-    parser.add_argument("--prune_method", default='merge', type=str, choices=["merge", "magnitude", "wanda", "sparsegpt", "shortened_llm", "bonsai",
+    parser.add_argument('--calib_dataset', type=str, default="c4", choices=["wikitext2", "c4", "bookcorpus", "random"])
+    parser.add_argument("--prune_method", default='merge', type=str, choices=["select", "merge", "magnitude", "wanda", "sparsegpt", "shortened_llm", "bonsai",
                         "ablate_mag_seq", "ablate_wanda_seq", "ablate_mag_iter", "ablate_wanda_iter", "search", "none"])
     #! --- for Bonsai starts
     parser.add_argument('--bonsai_prune_method', type=str, default="wanda", choices=["magnitude", "wanda", "random"])
@@ -203,9 +203,11 @@ def main():
     torch.random.manual_seed(args.seed)
 
     save_root = f'output/{args.model.split("/")[-1]}'
+    if args.save_model:
+        os.makedirs(args.save_model, exist_ok=True)
 
     if not args.save_model:
-        if args.prune_method == "merge":
+        if args.prune_method == "merge" or args.prune_method == "select":
             if args.merge_ranges == 'auto':
                 if args.target_var:
                     args.save_model = f'{save_root}/{args.prune_method}_{args.target_var}_{args.merge_thresh}'
@@ -266,6 +268,8 @@ def main():
 
         if args.sparsity_ratio != 0:
             print("pruning starts")
+            if args.prune_method == "select":
+                model = select_layers(args, model)
             if args.prune_method == "merge":
                 model = merge_layers(args, model, tokenizer, device)
             elif args.prune_method == "wanda":
@@ -284,8 +288,8 @@ def main():
             elif args.prune_method == "none":
                 pass
         #!
-        model.save_pretrained(args.save_model)
-        tokenizer.save_pretrained(args.save_model)
+        # model.save_pretrained(args.save_model)
+        # tokenizer.save_pretrained(args.save_model)
 
     compressed_size, compressed_memory = get_model_size_and_memory(model)
     print("*"*30)
@@ -302,7 +306,7 @@ def main():
     sparsity_ratio_unified = 1 - cur_nozero_param_count / original_nozero_param_count
     print(f"sparsity unified {sparsity_ratio_unified:.4f}")
     print("*"*30)
-    assert 1==0
+    # assert 1==0
     # ################################################################
     # ppl_test = eval_ppl(args, model, tokenizer, device)
     perplexity_results = {}
