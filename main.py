@@ -1,10 +1,9 @@
-
 import argparse, os, torch, json, pickle
 import numpy as np
 from transformers import AutoTokenizer, AutoModelForCausalLM, AutoConfig
 from importlib.metadata import version
 
-from utils.prune import prune_wanda, prune_magnitude, prune_sparsegpt, prune_shortened_llm, prune_bonsai, prune_ablate, check_sparsity, merge_layers, select_layers, get_model_size_and_memory
+from utils.prune import prune_wanda, prune_magnitude, prune_sparsegpt, prune_shortened_llm, prune_bonsai, prune_ablate, check_sparsity, merge_layers, select_layers, get_model_size_and_memory, prune_shortgpt, prune_laco
 from utils.eval import eval_ppl, eval_zero_shot
 # bonsai
 from utils.lib.modelling_llama_mod import LlamaForCausalLM
@@ -153,7 +152,7 @@ def main():
     parser.add_argument("--sparsity_type", type=str, default='unstructured', choices=["unstructured", "4:8", "2:4"])  # not for bonsai
     parser.add_argument('--calib_dataset', type=str, default="c4", choices=["wikitext2", "c4", "bookcorpus", "random"])
     parser.add_argument("--prune_method", default='merge', type=str, choices=["select", "merge", "magnitude", "wanda", "sparsegpt", "shortened_llm", "bonsai",
-                        "ablate_mag_seq", "ablate_wanda_seq", "ablate_mag_iter", "ablate_wanda_iter", "search", "none"])
+                        "ablate_mag_seq", "ablate_wanda_seq", "ablate_mag_iter", "ablate_wanda_iter", "search", "shortgpt", "laco", "none"])
     #! --- for Bonsai starts
     parser.add_argument('--bonsai_prune_method', type=str, default="wanda", choices=["magnitude", "wanda", "random"])
     parser.add_argument('--tol', type=float, default=0.02, help="What level of tolerance close to the target sparsity to accept")
@@ -186,6 +185,11 @@ def main():
     parser.add_argument("--target_compression_ratio", type=float, default=0.5, help="target compression_ratio for the model")
     #! --- for merging ends
     
+    #! --- for LACO starts
+    parser.add_argument("--merge_layers", type=int, default=4, help="Number of layers to merge together in LACO")
+    parser.add_argument("--threshold", type=float, default=0.25, help="Similarity threshold for LACO merging")
+    #! --- for LACO ends
+    
     parser.add_argument("--cache_dir", default="llm_weights", type=str )
     parser.add_argument('--use_variant', action="store_true", help="whether to use the wanda variant described in the appendix")
     # parser.add_argument('--save', type=str, default='output', help='Path to save results.')
@@ -202,7 +206,7 @@ def main():
     np.random.seed(args.seed)
     torch.random.manual_seed(args.seed)
 
-    save_root = f'output/{args.model.split("/")[-1]}'
+    save_root = f'/home/scratch/changl8/prune_llm/{args.model.split("/")[-1]}'
     if args.save_model:
         os.makedirs(args.save_model, exist_ok=True)
 
@@ -218,8 +222,8 @@ def main():
                     args.save_model = f'{save_root}/{args.prune_method}_{args.target_var}_{args.merge_ranges}'
                 else:
                     args.save_model = f'{save_root}/{args.prune_method}_{args.num_components}_{args.merge_ranges}'
-        elif args.prune_method == "shortened_llm":
-            args.save_model = f'{save_root}/{args.prune_method}_{args.num_components}'
+        elif args.prune_method in ["shortened_llm", "shortgpt", "laco"]:
+            args.save_model = f'{save_root}/{args.prune_method}/{args.num_components}'
         elif args.prune_method == 'none':
             args.save_model = f'{save_root}/{args.prune_method}'
         else: args.save_model = f'{save_root}/{args.prune_method}_{args.sparsity_ratio}'
@@ -242,7 +246,7 @@ def main():
     model = get_llm(args.model, args.cache_dir)
     if args.calib_dataset == "bookcorpus": model.seqlen = 128
     tokenizer = AutoTokenizer.from_pretrained(args.model, use_fast=False)
-    device = torch.device("cuda:0")
+    device = torch.device("cuda:0") if torch.cuda.is_available() else torch.device("cpu")
     # ppl_train,ppl_test = eval_ppl(model, tokenizer, seed=args.seed, device=device, nsamples=8, dataset=args.calib_dataset)
     # print(f'{args.calib_dataset} perplexity Train {ppl_train} Test {ppl_test}')
     orig_size, orig_memory = get_model_size_and_memory(model)
@@ -285,6 +289,10 @@ def main():
                 # print(model)
             elif "ablate" in args.prune_method:
                 prune_ablate(args, model, tokenizer, device, prune_n=prune_n, prune_m=prune_m)
+            elif args.prune_method == "shortgpt":
+                model = prune_shortgpt(args, model, tokenizer, device)
+            elif args.prune_method == "laco":
+                model = prune_laco(args, model, tokenizer, device)
             elif args.prune_method == "none":
                 pass
         #!
@@ -309,11 +317,6 @@ def main():
     # assert 1==0
     # ################################################################
     # ppl_test = eval_ppl(args, model, tokenizer, device)
-    perplexity_results = {}
-    for calib_dataset in calib_choices:
-        ppl_train, ppl_test = eval_ppl(model, tokenizer, seed=args.seed, device=device, nsamples=8, dataset=calib_dataset)
-        perplexity_results[calib_dataset] = {'train': ppl_train, 'test': ppl_test}
-        print(f'{calib_dataset} perplexity Train {ppl_train} Test {ppl_test}')
     # print(f"wikitext perplexity {ppl_test}")
     #! calculate FLOPs
     
@@ -330,6 +333,11 @@ def main():
 
 
     if args.eval_zero_shot:
+        perplexity_results = {}
+        for calib_dataset in ["wikitext2", "c4"]:
+            ppl_train, ppl_test = eval_ppl(model, tokenizer, seed=args.seed, device=device, nsamples=8, dataset=calib_dataset)
+            perplexity_results[calib_dataset] = {'train': ppl_train, 'test': ppl_test}
+            print(f'{calib_dataset} perplexity Train {ppl_train} Test {ppl_test}')
         accelerate=False
         if "30b" in args.model or "65b" in args.model or "70b" in args.model:
             accelerate=True

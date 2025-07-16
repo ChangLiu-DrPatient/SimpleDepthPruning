@@ -2,6 +2,7 @@
 
 import time, pickle, heapq, copy, torch
 import torch.nn as nn 
+import os
 from .sparsegpt import SparseGPT 
 from .layerwrapper import WrappedGPT
 from .data import get_loaders 
@@ -306,7 +307,8 @@ def set_model_device_evalmode(model, device, fix_decapoda_config=False, use_bflo
 
 @torch.no_grad()
 def prune_shortened_llm(args, model, tokenizer, device=torch.device("cuda:0"), start_layer=1, end_layer=30):
-    sorted_ppl_results_path = os.path.abspath(os.path.join(args.save_model, '..', f'sorted_ppl_{args.calib_dataset}.pkl'))
+    print("Using shortened llama pruning method...")
+    sorted_ppl_results_path = os.path.abspath(os.path.join(args.save_model, '..',f'sorted_ppl_{args.calib_dataset}.pkl'))
     print(sorted_ppl_results_path)
     # assert 1==0
     if os.path.isfile(sorted_ppl_results_path):
@@ -314,7 +316,7 @@ def prune_shortened_llm(args, model, tokenizer, device=torch.device("cuda:0"), s
             sorted_layer_ppl = pickle.load(f)
     else:
         print("loading calibration data")
-        dataloader, _ = get_loaders(args.calib_dataset,nsamples=args.nsamples,seed=args.seed,seqlen=model.seqlen,tokenizer=tokenizer)
+        dataloader, _ = get_loaders(args.calib_dataset, nsamples=args.nsamples,seed=args.seed,seqlen=model.seqlen,tokenizer=tokenizer)
         ppl = eval_ppl_train(model, dataloader, bs=1, device=device, seqlen=model.seqlen)
         print(f"original ppl {ppl}\n")
         layers = model.model.layers
@@ -327,8 +329,7 @@ def prune_shortened_llm(args, model, tokenizer, device=torch.device("cuda:0"), s
                 device=device,
                 verbose=False
             )
-            # if args.calib_dataset == "bookcorpus": model_pruned.seqlen = 128
-            ppl = eval_ppl_train(model_pruned, dataloader, bs=1, device=device)
+            ppl = eval_ppl_train(model_pruned, dataloader, bs=1, device=device, seqlen=model.seqlen)
             print(f"block {block_idx} ppl {ppl}\n")
             unsorted_results.append((block_idx, ppl))
             del model_pruned
@@ -343,14 +344,15 @@ def prune_shortened_llm(args, model, tokenizer, device=torch.device("cuda:0"), s
     keep_block_info = [i for i in range(start_layer)] + [i for i in range(end_layer + 1, len(model.model.layers))]
     unimportance_order = [idx for idx in unimportance_order if idx not in keep_block_info]
 
-    # Block-level pruning
-    model = get_block_pruned_network(
-        model,
-        unimportance_order=unimportance_order,
-        num_pruned_blocks=end_layer - start_layer + 1 - args.num_components,
-        device=device,
-        verbose=False
-    )
+    # In-place block-level pruning
+    layers = model.model.layers
+    num_to_prune = end_layer - start_layer + 1 - args.num_components
+    layers_to_remove = unimportance_order[:num_to_prune]
+    for idx in sorted(layers_to_remove, reverse=True):
+        del layers[idx]
+    model.config.num_hidden_layers = len(layers)
+    model.half()
+    model.eval()
     torch.cuda.empty_cache()
     return model
 
@@ -605,7 +607,7 @@ def prune_bonsai(args, model, tokenizer, device=torch.device("cuda:0")):
     print(f'sparsity = {cur_sparsity:.4f}')
 
 
-#! our method
+#--------------- our method: layer merging ---------------#
 def find_blocks_indices(sim, matrix):
     n = matrix.shape[0]
     blocks = []
@@ -714,7 +716,7 @@ def merge_from_ranges(args, model, merge_ranges):
     compressed_size, compressed_memory = get_model_size_and_memory(model)
     return model, compressed_size / original_size
 
-#! new method: k-medioids 
+#--------------- k-medioids ---------------#
 def select_layers(args, model):
     original_size, original_memory = get_model_size_and_memory(model)
     prune_ranges = [tuple(map(int, r.split('-'))) for r in args.merge_ranges]
@@ -776,3 +778,382 @@ def k_medoids_on_weights(weights, k):
     selected_layers = sorted(kmedoids.medoid_indices_)
     selected_weights = [weights[i] for i in selected_layers]
     return selected_weights, selected_layers
+
+
+#------------- ShortGPT baseline pruning (self-contained) -----------------#
+def block_influence(input_hidden_state, output_hidden_state, angular=False):
+    """
+    Compute block influence between two hidden states (B, S, D).
+    """
+    _, _, d = input_hidden_state.shape
+    input_hidden_state = input_hidden_state.reshape(-1, d)
+    output_hidden_state = output_hidden_state.reshape(-1, d)
+    norm_input = input_hidden_state.norm(dim=-1, keepdim=True)
+    norm_output = output_hidden_state.norm(dim=-1, keepdim=True)
+    sim = (input_hidden_state @ output_hidden_state.T) / (norm_input * norm_output)
+    sim = sim.diagonal().nan_to_num(nan=0.5)
+    if angular:
+        return (torch.arccos(sim) / torch.pi)
+    return 1 - sim
+
+
+def compute_or_load_importances(args, model, tokenizer, device, angular, dataloader, max_seq_len, stride):
+    """
+    Compute or load cached block influence importances for all layers (0 to n_layers-1).
+    Returns a tensor of shape (n_layers,).
+    Caches importances for the full range for reuse.
+    """
+    n_layers = len(model.model.layers)
+    model_name_safe = args.model.replace('/', '_')
+    importances_path = os.path.abspath(os.path.join(args.save_model, '..', f'shortgpt_importances_{model_name_safe}_{args.calib_dataset}_0-{n_layers-1}.pt'))
+    if os.path.isfile(importances_path):
+        print(f"Loading cached layer importances for full range from {importances_path}")
+        importances = torch.load(importances_path, map_location='cpu')
+    else:
+        print(f"Computing layer importances for full range and saving to {importances_path}")
+        importances = torch.zeros(n_layers, dtype=torch.float32, device=device)
+        for batch in dataloader:
+            # Use input tensor directly, as in eval_ppl_train
+            if isinstance(batch, (list, tuple)) and hasattr(batch[0], 'shape'):
+                input_ids = batch[0]
+            else:
+                raise ValueError("Batch format not supported for importance computation.")
+
+            # Optionally trim/pad input_ids to max_seq_len
+            if input_ids.shape[1] > max_seq_len:
+                input_ids = torch.tensor(input_ids[:, :max_seq_len])
+            elif input_ids.shape[1] < max_seq_len:
+                pad_len = max_seq_len - input_ids.shape[1]
+                input_ids = torch.cat([
+                    input_ids,
+                    input_ids.new_full((input_ids.shape[0], pad_len), tokenizer.pad_token_id)
+                ], dim=1)
+            # Move input_ids and attn_mask to the correct device
+            input_ids = input_ids.to(device)
+            attn_mask = torch.tensor((input_ids != tokenizer.pad_token_id)).long().to(device)
+
+            with torch.no_grad():
+                outputs = model(
+                    input_ids=input_ids,
+                    attention_mask=attn_mask,
+                    output_hidden_states=True,
+                )
+            hiddens = outputs.hidden_states
+            n = 1  # Always use 1 for global importances
+            for i in range(len(hiddens) - n):
+                in_hidden = hiddens[i]
+                out_hidden = hiddens[i+n]
+                if angular:
+                    in_hidden = in_hidden[:, -1:]
+                    out_hidden = out_hidden[:, -1:]
+                importances[i] += block_influence(in_hidden, out_hidden, angular=angular).sum()
+        importances_cpu = importances.detach().cpu()
+        torch.save(importances_cpu, importances_path)
+        importances = importances_cpu
+    return importances
+
+
+def prune_shortgpt(args, model, tokenizer, device=torch.device("cuda:0")):
+    """
+    Prune transformer layers using the ShortGPT baseline (block influence based importance, layer removal).
+    Args:
+        args: Namespace with at least num_components (layers to keep), merge_ranges (list of ranges or 'auto'), angular (bool), calib_dataset, nsamples, seed, etc.
+        model: HuggingFace model (transformers style, e.g., Llama-3.1).
+        tokenizer: HuggingFace tokenizer.
+        device: torch.device
+    Returns:
+        pruned_model: model with layers physically removed (not in-place)
+    Behavior:
+        - If merge_ranges is provided (not 'auto'), prune only within the specified ranges, keeping num_components layers in each range.
+        - If merge_ranges is 'auto' or not provided, prune globally.
+    Note:
+        - Layer importances are always computed/cached for the full range and reused for all selection strategies.
+    """
+    print("Using ShortGPT pruning method...")
+    layers = model.model.layers
+    n_layers = len(layers)
+    num_components = getattr(args, 'num_components', None)
+    angular = getattr(args, 'angular', False)
+    merge_ranges = getattr(args, 'merge_ranges', 'auto')
+    if isinstance(merge_ranges, str) and merge_ranges == 'auto':
+        merge_ranges = None
+    elif isinstance(merge_ranges, str):
+        merge_ranges = [merge_ranges]
+    if num_components is None:
+        raise ValueError("Specify num_components (number of layers to keep in each range or globally)")
+    assert num_components > 0
+    max_seq_len = getattr(args, 'max_seq_len', model.seqlen)
+    stride = getattr(args, 'stride', 256)
+    dataloader, _ = get_loaders(args.calib_dataset, nsamples=args.nsamples, seed=args.seed, seqlen=model.seqlen, tokenizer=tokenizer)
+    def parse_range(r):
+        if isinstance(r, (list, tuple)) and len(r) == 2:
+            return int(r[0]), int(r[1])
+        if isinstance(r, str):
+            s, e = r.split('-')
+            return int(s), int(e)
+        raise ValueError(f"Invalid range: {r}")
+    # Always compute/load importances for the full range
+    full_importances = compute_or_load_importances(
+        args, model, tokenizer, device, angular, dataloader, max_seq_len, stride
+    )
+    if not merge_ranges:
+        ranges = [(0, n_layers-1)]
+    else:
+        ranges = [parse_range(r) for r in merge_ranges]
+    all_layers_to_remove = set()
+    for (start, end) in ranges:
+        assert 0 <= start <= end < n_layers, f"Invalid range: {start}-{end} for n_layers={n_layers}"
+        range_len = end - start + 1
+        n_keep = min(num_components, range_len)
+        n_prune = range_len - n_keep
+        if n_prune <= 0:
+            print(f"Range {start}-{end}: nothing to prune (num_components >= range length)")
+            continue
+        importances = full_importances[start:end+1]
+        if angular:
+            min_sum = float('inf')
+            min_start = 0
+            for s in range(range_len - n_prune + 1):
+                block_sum = importances[s:s+n_prune].sum().item()
+                if block_sum < min_sum:
+                    min_sum = block_sum
+                    min_start = s
+            layers_to_remove = list(range(start + min_start, start + min_start + n_prune))
+        else:
+            sorted_indices = torch.argsort(importances)[:n_prune].tolist()
+            layers_to_remove = [start + idx for idx in sorted_indices]
+        print(f"ShortGPT pruning (range {start}-{end}): removing layers {layers_to_remove} (out of {n_layers})")
+        all_layers_to_remove.update(layers_to_remove)
+    for idx in sorted(all_layers_to_remove, reverse=True):
+        del layers[idx]
+    model.config.num_hidden_layers = len(model.model.layers)
+    model.half()
+    model.eval()
+    torch.cuda.empty_cache()
+    return model
+
+
+#------------- LACO pruning (adaptive, num_components) -----------------#
+@torch.no_grad()
+def prune_laco(args, model, tokenizer, device=torch.device("cuda:0")):
+    """
+    Adaptive LACO pruning: merge layers only if similarity threshold is met, following original LACO behavior.
+    Memory-efficient approach: compute original outputs first, then work with CPU copy for pruning.
+    Args:
+        args: Namespace with at least num_components (number of layers to keep), merge_layers (max layers to merge), threshold (similarity threshold), calib_dataset, nsamples, seed, etc.
+        model: HuggingFace model (transformers style, e.g., Llama-3.1).
+        tokenizer: HuggingFace tokenizer.
+        device: torch.device
+    Returns:
+        model: model with layers merged and removed in-place
+    """
+    import copy
+    print("Using adaptive LACO pruning method (memory-efficient)...")
+    num_components = getattr(args, 'num_components', None)
+    merge_layers = getattr(args, 'merge_layers', 7)
+    threshold = getattr(args, 'threshold', 0.45)
+    if num_components is None:
+        raise ValueError("Specify num_components (number of layers to keep)")
+    if merge_layers < 2:
+        raise ValueError("merge_layers must be at least 2 (merge_layers-1 layers will be merged)")
+    layers = model.model.layers
+    n_layers = len(layers)
+    if n_layers <= num_components:
+        print(f"Nothing to prune: current layers ({n_layers}) <= target layers ({num_components})")
+        return model
+    
+    # LACO parameters matching original implementation
+    INTERVAL = 1
+    
+    # Determine layer range based on args.merge_ranges
+    merge_ranges = getattr(args, 'merge_ranges', 'auto')
+    if merge_ranges == 'auto':
+        # Use full model range like original LACO
+        HIGHEST_LAY = n_layers - 1
+        LOWEST_LAY = 0
+    else:
+        # Parse merge_ranges to get the layer range
+        if isinstance(merge_ranges, str):
+            merge_ranges = [merge_ranges]
+        
+        # For LACO, we only support one range
+        assert len(merge_ranges) == 1, f"LACO only supports one merge range, got {len(merge_ranges)}"
+        
+        range_str = merge_ranges[0]
+        if '-' in range_str:
+            start_str, end_str = range_str.split('-')
+            LOWEST_LAY = int(start_str)
+            HIGHEST_LAY = int(end_str)
+        else:
+            # Single layer
+            LOWEST_LAY = HIGHEST_LAY = int(range_str)
+        
+        # Validate range
+        assert 0 <= LOWEST_LAY <= HIGHEST_LAY < n_layers, f"Invalid range {LOWEST_LAY}-{HIGHEST_LAY} for model with {n_layers} layers"
+    
+    # Load calibration data
+    dataloader, _ = get_loaders(args.calib_dataset, nsamples=args.nsamples, seed=args.seed, seqlen=model.seqlen, tokenizer=tokenizer)
+    
+    # Step 1: Compute original model outputs and store on CPU
+    print("Computing original model outputs...")
+    original_outputs = []
+    for batch in dataloader:
+        if isinstance(batch, (list, tuple)) and hasattr(batch[0], 'shape'):
+            input_ids = batch[0]
+        else:
+            continue
+        if not torch.is_tensor(input_ids):
+            input_ids = torch.tensor(input_ids)
+        input_ids = input_ids.to(device)
+        attn_mask = torch.tensor((input_ids != tokenizer.pad_token_id)).long().to(device)
+        
+        with torch.no_grad():
+            outputs = model(input_ids=input_ids, attention_mask=attn_mask, output_hidden_states=True)
+        hidden_states = outputs.hidden_states[-1]  # Last hidden state
+        original_outputs.append(hidden_states.detach().cpu())  # Move to CPU
+    
+    # Move original model to CPU to free GPU memory
+    model = model.cpu()
+    
+    # Step 2: Create CPU copy of model for pruning
+    print("Creating CPU copy of model for pruning...")
+    cpu_model = copy.deepcopy(model)
+    
+    def merge_layers_in_place(model, merge_base_layer, merge_layer_num):
+        merge_layer_num = min(merge_layer_num, len(model.model.layers) - merge_base_layer - 1)
+        for diff_layer in range(merge_base_layer + 1, merge_base_layer + 1 + merge_layer_num):
+            model.model.layers[merge_base_layer].mlp.gate_proj.weight.data.add_(
+                model.model.layers[diff_layer].mlp.gate_proj.weight.data - model.model.layers[merge_base_layer].mlp.gate_proj.weight.data)
+            model.model.layers[merge_base_layer].mlp.down_proj.weight.data.add_(
+                model.model.layers[diff_layer].mlp.down_proj.weight.data - model.model.layers[merge_base_layer].mlp.down_proj.weight.data)
+            model.model.layers[merge_base_layer].mlp.up_proj.weight.data.add_(
+                model.model.layers[diff_layer].mlp.up_proj.weight.data - model.model.layers[merge_base_layer].mlp.up_proj.weight.data)
+            model.model.layers[merge_base_layer].self_attn.q_proj.weight.data.add_(
+                model.model.layers[diff_layer].self_attn.q_proj.weight.data - model.model.layers[merge_base_layer].self_attn.q_proj.weight.data)
+            model.model.layers[merge_base_layer].self_attn.k_proj.weight.data.add_(
+                model.model.layers[diff_layer].self_attn.k_proj.weight.data - model.model.layers[merge_base_layer].self_attn.k_proj.weight.data)
+            model.model.layers[merge_base_layer].self_attn.v_proj.weight.data.add_(
+                model.model.layers[diff_layer].self_attn.v_proj.weight.data - model.model.layers[merge_base_layer].self_attn.v_proj.weight.data)
+            model.model.layers[merge_base_layer].self_attn.o_proj.weight.data.add_(
+                model.model.layers[diff_layer].self_attn.o_proj.weight.data - model.model.layers[merge_base_layer].self_attn.o_proj.weight.data)
+        for diff_layer in range(merge_base_layer + merge_layer_num, merge_base_layer, -1):
+            del model.model.layers[diff_layer]
+    
+    def calculate_similarity(original_outputs, pruned_model, tokenizer, dataloader, device):
+        """Calculate similarity between original outputs and pruned model outputs (inference on GPU, comparison on CPU)"""
+        sim_list = []
+        for i, batch in enumerate(dataloader):
+            if isinstance(batch, (list, tuple)) and hasattr(batch[0], 'shape'):
+                input_ids = batch[0]
+            else:
+                continue
+            if not torch.is_tensor(input_ids):
+                input_ids = torch.tensor(input_ids)
+            input_ids = input_ids.to(device)  # Move to GPU for inference
+            attn_mask = torch.tensor((input_ids != tokenizer.pad_token_id)).long().to(device)  # Move to GPU for inference
+            
+            with torch.no_grad():
+                outputs = pruned_model(input_ids=input_ids, attention_mask=attn_mask, output_hidden_states=True)
+            pruned_hidden_states = outputs.hidden_states[-1].detach().cpu()  # Move to CPU immediately
+            
+            # Clear GPU memory
+            del outputs
+            torch.cuda.empty_cache()
+            
+            # Compare with original output (both on CPU)
+            original_hidden = original_outputs[i]  # Already on CPU
+            sim = torch.cosine_similarity(
+                original_hidden.squeeze(0).flatten().unsqueeze(0),
+                pruned_hidden_states.squeeze(0).flatten().unsqueeze(0)
+            )
+            sim_list.append(sim.item())
+        
+        if sim_list:
+            return sum(sim_list) / len(sim_list)
+        else:
+            return 0.0
+
+    # Main LACO pruning loop - following original implementation
+    lay = HIGHEST_LAY - merge_layers  # Start from high layer like original
+    print(f"Starting LACO pruning from layer {lay}")
+    
+    while lay >= LOWEST_LAY:
+        print(f"Current layer: {lay}, Current model layers: {len(cpu_model.model.layers)}")
+        
+        # Check if we've reached target number of components
+        if len(cpu_model.model.layers) <= num_components:
+            print(f"Reached target number of components ({num_components}), stopping.")
+            break
+            
+        # Try to merge layers starting from current layer
+        tmp_merged_model = copy.deepcopy(cpu_model)
+        merge_layer_num = min(merge_layers - 1, len(tmp_merged_model.model.layers) - lay - 1)
+        
+        if merge_layer_num > 0:
+            merge_layers_in_place(tmp_merged_model, lay, merge_layer_num)
+            
+            # Move to GPU for inference, then compute similarity
+            temp_gpu_model = tmp_merged_model.to(device)
+            sim_value = calculate_similarity(original_outputs, temp_gpu_model, tokenizer, dataloader, device)
+            print(f"Similarity: {sim_value:.4f}, Threshold: {threshold}")
+            
+            # Move back to CPU to free GPU memory immediately
+            temp_gpu_model = temp_gpu_model.cpu()
+            torch.cuda.empty_cache()
+            
+            if sim_value > threshold:
+                print(f"Accepted merge of {merge_layer_num + 1} layers at {lay}")
+                cpu_model = tmp_merged_model
+                # Adjust layer index after successful merge (lay -= INTERVAL is redundant since we always adjust)
+                lay = len(cpu_model.model.layers) - 1 - merge_layers
+            else:
+                print(f"Rejected merge at layer {lay}")
+                lay -= 1  # Try next layer like original LACO
+        else:
+            print(f"Cannot merge at layer {lay} (not enough layers)")
+            lay -= 1  # Try next layer like original LACO
+        
+        # Clean up temporary models
+        del tmp_merged_model
+        if 'temp_gpu_model' in locals():
+            del temp_gpu_model
+        torch.cuda.empty_cache()
+    
+    # Force merging if we haven't reached num_components
+    if len(cpu_model.model.layers) > num_components:
+        print(f"LACO merging complete but model still has {len(cpu_model.model.layers)} layers, target is {num_components}")
+        print("Forcing additional merges to reach target...")
+        
+        while len(cpu_model.model.layers) > num_components:
+            # Try to merge the last few layers
+            current_layers = len(cpu_model.model.layers)
+            layers_to_merge = min(merge_layers - 1, current_layers - num_components)
+            
+            # Force merge the last layers
+            merge_base_layer = current_layers - 1 - layers_to_merge
+            print(f"Forcing merge of {layers_to_merge + 1} layers at position {merge_base_layer}")
+            merge_layers_in_place(cpu_model, merge_base_layer, layers_to_merge)
+    
+    print(f"Final model has {len(cpu_model.model.layers)} layers (target: {num_components})")
+    
+    # Step 5: Apply the final pruned model to the original model
+    print("Applying final pruned model...")
+    # Clear the original model layers
+    while len(model.model.layers) > 0:
+        del model.model.layers[0]
+    
+    # Copy the pruned layers from CPU model
+    for layer in cpu_model.model.layers:
+        model.model.layers.append(layer)
+    
+    # Update model configuration
+    model.config.num_hidden_layers = len(model.model.layers)
+    
+    # Move model back to original device
+    model = model.to(device)
+    model.half()
+    model.eval()
+    torch.cuda.empty_cache()
+    
+    print(f"Adaptive LACO pruning complete: {len(model.model.layers)} layers remaining")
+    return model

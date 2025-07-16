@@ -1,25 +1,9 @@
-## Documentation for PCA-based LLM Pruning
+## Quite simple depth-pruning methods for large language models
 
 ### modifications
 
-11/24/2024:
+modified the newest version of the lm-eval-harness, after downloading the newest repo at https://github.com/huggingface/lm-evaluation-harness, replace lm-evaluation-harness/lm_eval/evaluator.py and lm-evaluation-harness/lm_eval/models/huggingface.py using the code provided in lm_eval_modify/.
 
-modified the newest version of the lm-eval-harness, after downloading the newest repo at https://github.com/huggingface/lm-evaluation-harness, replace lm_eval/evaluator.py and lm_eval/models/huggingface.py using the code provided in lm_eval_modify/.
+Add the **leaderboard_short** folder to lm-evaluation-harness/lm_eval/tasks/.
 
-To run the leaderboard, simply add ``leaderboard'' to the task\_list at main.py, line 99.
-
-11/25/2024:
-
-integrated Bonsai as a baseline. The "--dataset" flag in the Bonsai repo is modified to "--calib_dataset" and the "--prune_method" flag is modified to "--bonsai_prune_method". A sample run would be:
-
-```
-CUDA_VISIBLE_DEVICES=1 python main.py --model meta-llama/Llama-2-7b-hf --calib_dataset wikitext2 --sparsity_ratio 0.5 --masks_per_iter 6 --nsamples 1 --save outdir --prune_frac 0.1 --bsz 1 --prune_method bonsai --eval_zero_shot
-```
-
-12/5/2024：
-
-integrated the layer merging method, parallel to other pruning methods.
-
-12/15/2024:
-
-added automatic layer selection heuristic and model size/memory helper function.
+To run PruneBench, simply add ``leaderboard_short'' to the task\_list at main.py, line 345.
