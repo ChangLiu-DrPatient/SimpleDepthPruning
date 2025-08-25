@@ -5,4 +5,6 @@ output/
 *.txt
 *.pkl
 *.ipynb
-*.npy
+*.npy__pycache__/
+*.pyc
+*.pyo
