@@ -14,110 +14,6 @@ print('transformers', version('transformers'))
 print('accelerate', version('accelerate'))
 print('# of gpus: ', torch.cuda.device_count())
 
-
-def load_model_with_rope_scaling_adjustment(model_name, cache_dir='llm_weights', use_auth_token=True, use_bfloat16=False):
-    # local_path = get_local_model_path(model_path)
-    
-    # Create base directory if it doesn't exist
-    # os.makedirs(local_path, exist_ok=True)
-    
-    # Check if model already exists locally
-    # if not check_model_exists(local_path):
-    #     print(f"Model not found in {local_path}. Downloading...")
-    #     try:
-    #         # Download model files to local path
-    #         config = AutoConfig.from_pretrained(model_path, use_auth_token=use_auth_token)
-    #         model = AutoModelForCausalLM.from_pretrained(
-    #             model_path,
-    #             use_auth_token=use_auth_token,
-    #             torch_dtype=torch.bfloat16 if use_bfloat16 else None
-    #         )
-    #         tokenizer = AutoTokenizer.from_pretrained(model_path, use_auth_token=use_auth_token)
-            
-    #         # Save files locally
-    #         config.save_pretrained(local_path)
-    #         model.save_pretrained(local_path)
-    #         tokenizer.save_pretrained(local_path)
-    #         print(f"Model downloaded and saved to {local_path}")
-    #     except Exception as e:
-    #         print(f"Error downloading model: {e}")
-    #         raise
-    # else:
-    #     print(f"Loading model from local cache: {local_path}")
-
-    
-    # try:
-    #     with open(os.path.join(local_path, 'config.json'), 'r') as f:
-    #         config_dict = json.load(f)
-        
-    #     if 'rope_scaling' in config_dict:
-    #         original_rope_scaling = config_dict['rope_scaling'].copy()
-    #         print(f"Original rope_scaling: {original_rope_scaling}")
-            
-    #         config_dict['rope_scaling'] = {
-    #             'type': original_rope_scaling.get('rope_type', 'linear'),
-    #             'factor': original_rope_scaling.get('factor', 1.0)
-    #         }
-    #         print(f"Adjusted rope_scaling: {config_dict['rope_scaling']}")
-        
-    #     config = AutoConfig.from_pretrained(None, **config_dict)
-        
-    #     if use_bfloat16:
-    #         model = AutoModelForCausalLM.from_pretrained(
-    #             local_path,
-    #             config=config,
-    #             torch_dtype=torch.bfloat16
-    #         )
-    #     else:
-    #         model = AutoModelForCausalLM.from_pretrained(
-    #             local_path,
-    #             config=config
-    #         )
-    # except Exception as e:
-    #     print(f"Error loading model with config adjustment: {e}")
-    #     print("Attempting to load model without config adjustment...")
-    #     if use_bfloat16:
-    #         model = AutoModelForCausalLM.from_pretrained(
-    #             local_path,
-    #             torch_dtype=torch.bfloat16
-    #         )
-    #     else:
-    #         model = AutoModelForCausalLM.from_pretrained(local_path)
-    config = AutoConfig.from_pretrained(model_name)
-    if hasattr(config, 'rope_scaling'):
-        original_rope_scaling = config.rope_scaling
-        if original_rope_scaling is not None:
-            print(f"Original rope_scaling: {original_rope_scaling}")
-            
-            config.rope_scaling = {
-                'type': original_rope_scaling.get('rope_type', 'linear'),
-                'factor': original_rope_scaling.get('factor', 1.0)
-            }
-        print(f"Adjusted rope_scaling: {config.rope_scaling}")
-    # # print(config_dict)
-    # if 'rope_scaling' in config_dict and config_dict['rope_scaling'] is not None:
-    #     original_rope_scaling = config_dict['rope_scaling'].copy()
-    #     print(f"Original rope_scaling: {original_rope_scaling}")
-        
-    #     config_dict['rope_scaling'] = {
-    #         'type': original_rope_scaling.get('rope_type', 'linear'),
-    #         'factor': original_rope_scaling.get('factor', 1.0)
-    #     }
-    #     print(f"Adjusted rope_scaling: {config_dict['rope_scaling']}")
-    
-    # config = AutoConfig.from_pretrained(model_name, **config_dict)
-    # turn config_dict back to config
-    # config = Config.from_dict(config_dict)
-    model = AutoModelForCausalLM.from_pretrained(model_name, 
-                                                cache_dir=cache_dir,
-                                                config=config,
-                                                torch_dtype=torch.bfloat16 if use_bfloat16 else torch.float16,
-                                                low_cpu_mem_usage=True, 
-                                                device_map="auto")
-    model.seqlen = model.config.max_position_embeddings 
-    return model
-
-
 def get_llm(model_name, cache_dir="llm_weights"):
     model = AutoModelForCausalLM.from_pretrained(
         model_name, 
@@ -186,7 +82,7 @@ def main():
     #! --- for merging ends
     
     #! --- for LACO starts
-    parser.add_argument("--merge_layers", type=int, default=4, help="Number of layers to merge together in LACO")
+    parser.add_argument("--merge_layers", type=int, default=2, help="Number of layers to merge together in LACO")
     parser.add_argument("--threshold", type=float, default=0.25, help="Similarity threshold for LACO merging")
     #! --- for LACO ends
     
@@ -206,7 +102,7 @@ def main():
     np.random.seed(args.seed)
     torch.random.manual_seed(args.seed)
 
-    save_root = f'/home/scratch/changl8/prune_llm/{args.model.split("/")[-1]}'
+    save_root = f'output/{args.model.split("/")[-1]}'
     if args.save_model:
         os.makedirs(args.save_model, exist_ok=True)
 
@@ -237,12 +133,6 @@ def main():
     model_name = args.model.split("/")[-1]
     print(f"loading llm model {args.model}")
 
-    # if args.prune_method == 'merge':
-    #     model = load_model_with_rope_scaling_adjustment(args.model, args.cache_dir, use_bfloat16=args.use_bfloat16)
-        # model = get_llm(args.model, args.cache_dir)
-        # assert 1==0
-        # model = AutoModelForCausalLM.from_pretrained(args.save_model, torch_dtype=torch.float16, low_cpu_mem_usage=True, device_map="auto")
-        
     model = get_llm(args.model, args.cache_dir)
     if args.calib_dataset == "bookcorpus": model.seqlen = 128
     tokenizer = AutoTokenizer.from_pretrained(args.model, use_fast=False)

@@ -1,0 +1,80 @@
+# ---- k-medioids clustering 
+CUDA_VISIBLE_DEVICES=0 nohup python -u main.py \
+--model meta-llama/llama-3.1-8b \
+--eval_zero_shot \
+--prune_method select \
+--target_module_name input_layernorm \
+--num_components 3 \
+--merge_ranges 1-30 > logs/llama_3.1_8b/select_layernorm/3.txt &
+
+--save_model /home/scratch/changl8/prune_llm/llama_3.1_8b/k_medioids_layernorm/10 
+
+CUDA_VISIBLE_DEVICES=2 nohup python -u main.py \
+--model meta-llama/llama-3.1-8b \
+--prune_method select \
+--target_module_name self_attn.k_proj \
+--num_components 12 \
+--merge_ranges 1-30 \
+--save_model /home/scratch/changl8/prune_llm/llama_3.1_8b/k_medioids_self_attn.k_proj/12 > logs/llama_3.1_8b/select_self_attn.k_proj/12.txt &
+
+
+# ----  Shortened_Llama_baseline
+CUDA_VISIBLE_DEVICES=3 nohup python -u main.py \
+--model meta-llama/llama-3.1-8b \
+--eval_zero_shot \
+--prune_method shortened_llm \
+--nsamples 8 \
+--num_components 3 > logs/llama_3.1_8b/shortened_llama/3_new.txt &
+
+
+# ---- shortgpt basline 
+CUDA_VISIBLE_DEVICES=3 nohup python -u main.py \
+--model meta-llama/llama-3.1-8b \
+--eval_zero_shot \
+--prune_method shortgpt \
+--nsamples 8 \
+--num_components 5 > logs/llama_3.1_8b/shortgpt/5.txt &
+
+# --- laco baseline  
+CUDA_VISIBLE_DEVICES=3 nohup python -u main.py \
+--model meta-llama/llama-3.1-8b \
+--eval_zero_shot \
+--prune_method laco \
+--nsamples 8 \
+--num_components 5 > logs/llama_3.1_8b/laco/5.txt &
+
+
+# ---- merging with seed inputs
+CUDA_VISIBLE_DEVICES=3 nohup python -u main.py \
+--model meta-llama/llama-3.1-8b \
+--eval_zero_shot \
+--prune_method merge \
+--merge_thresh 0.25 \
+--target_module_name input_layernorm \
+--nsamples 8 \
+--target_var 50 > logs/llama_3.1_8b/merge_act/th0.25_v50.txt &
+
+
+# ---- test sparsity for layermerge
+CUDA_VISIBLE_DEVICES=3 nohup python -u main.py \
+--model meta-llama/llama-3.1-8b \
+--prune_method merge \
+--merge_thresh 0.25 \
+--target_module_name input_layernorm \
+--nsamples 8 \
+--target_var 50 > logs/llama_3.1_8b/merge_act/th0.25_v50.txt &
+
+
+# ---- PCA mering on weight space 
+CUDA_VISIBLE_DEVICES=3 nohup python -u main.py \
+--model meta-llama/llama-3.1-8b \
+--eval_zero_shot \
+--prune_method merge \
+--num_components 3 \
+--merge_ranges 1-30 > logs/llama_3.1_8b/merge_weights/3.txt &
+
+# ---baseline
+CUDA_VISIBLE_DEVICES=0 nohup python -u main.py \
+--model meta-llama/llama-3.1-8b \
+--eval_zero_shot \
+--prune_method none > logs/llama3_8b_short_none.txt &
