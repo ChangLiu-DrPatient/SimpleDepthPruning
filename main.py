@@ -7,7 +7,7 @@ from utils.prune import prune_wanda, prune_magnitude, prune_sparsegpt, prune_sho
 from utils.eval import eval_ppl, eval_zero_shot
 # bonsai
 from utils.lib.modelling_llama_mod import LlamaForCausalLM
-from calflops import calculate_flops
+# from calflops import calculate_flops
 
 print('torch', version('torch'))
 print('transformers', version('transformers'))
