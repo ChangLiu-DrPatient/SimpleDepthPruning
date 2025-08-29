@@ -17,6 +17,32 @@ CUDA_VISIBLE_DEVICES=2 nohup python -u main.py \
 --merge_ranges 1-30 \
 --save_model /home/scratch/changl8/prune_llm/llama_3.1_8b/k_medioids_self_attn.k_proj/12 > logs/llama_3.1_8b/select_self_attn.k_proj/12.txt &
 
+# --- Wanda baseline
+CUDA_VISIBLE_DEVICES=3 nohup python -u main.py \
+--model meta-llama/llama-3.1-8b \
+--prune_method wanda \
+--eval_zero_shot \
+--sparsity_ratio 0.8437 > logs/llama_3.1_8b/wanda/0.8437.txt &
+
+CUDA_VISIBLE_DEVICES=1 nohup python -u main.py \
+--model meta-llama/llama-3.1-8b \
+--prune_method wanda \
+--eval_zero_shot \
+--sparsity_ratio 0.9062 > logs/llama_3.1_8b/wanda/0.9062.txt &
+
+# --- SparseGPT baseline
+CUDA_VISIBLE_DEVICES=3 nohup python -u main.py \
+--model meta-llama/llama-3.1-8b \
+--prune_method sparsegpt \
+--eval_zero_shot \
+--sparsity_ratio 0.8437 > logs/llama_3.1_8b/sparsegpt/0.8437.txt &
+
+CUDA_VISIBLE_DEVICES=1 nohup python -u main.py \
+--model meta-llama/llama-3.1-8b \
+--prune_method sparsegpt \
+--eval_zero_shot \
+--sparsity_ratio 0.9062 > logs/llama_3.1_8b/sparsegpt/0.9062.txt &
+
 
 # ----  Shortened_Llama_baseline
 CUDA_VISIBLE_DEVICES=3 nohup python -u main.py \
@@ -78,3 +104,4 @@ CUDA_VISIBLE_DEVICES=0 nohup python -u main.py \
 --model meta-llama/llama-3.1-8b \
 --eval_zero_shot \
 --prune_method none > logs/llama3_8b_short_none.txt &
+
